@@ -328,7 +328,7 @@ def train(
     with open("config.yml", "w", encoding="utf-8") as f:
         yaml.dump(yml_data, f, allow_unicode=True)
 
-    train_py = "train_ms.py" if not use_jp_extra else "train_ms_jp_extra.py"
+    train_py = "train_ms.py" if not use_jp_extra else "train_ms_jp_extra_prior_only.py"
     cmd = [train_py, "--config", str(config_path), "--model", str(dataset_path)]
     if skip_style:
         cmd.append("--skip_default_style")
@@ -521,7 +521,7 @@ def create_train_app():
                     gr.Markdown("学習時に特定の部分を凍結させるかどうか")
                     freeze_EN_bert = gr.Checkbox(
                         label="英語bert部分を凍結",
-                        value=False,
+                        value=True,
                     )
                     freeze_JP_bert = gr.Checkbox(
                         label="日本語bert部分を凍結",
@@ -529,7 +529,7 @@ def create_train_app():
                     )
                     freeze_ZH_bert = gr.Checkbox(
                         label="中国語bert部分を凍結",
-                        value=False,
+                        value=True,
                     )
                     freeze_style = gr.Checkbox(
                         label="スタイル部分を凍結",
@@ -537,7 +537,7 @@ def create_train_app():
                     )
                     freeze_decoder = gr.Checkbox(
                         label="デコーダ部分を凍結",
-                        value=False,
+                        value=True,
                     )
 
             with gr.Column():
@@ -562,21 +562,21 @@ def create_train_app():
                     )
                     epochs_manual = gr.Slider(
                         label="エポック数",
-                        value=100,
+                        value=10,
                         minimum=1,
                         maximum=1000,
                         step=1,
                     )
                     save_every_steps_manual = gr.Slider(
                         label="何ステップごとに結果を保存するか",
-                        value=1000,
+                        value=500,
                         minimum=100,
                         maximum=10000,
                         step=100,
                     )
                     log_interval_manual = gr.Slider(
                         label="Tensorboardのログ出力間隔",
-                        value=200,
+                        value=100,
                         minimum=10,
                         maximum=1000,
                         step=10,
