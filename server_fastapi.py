@@ -268,7 +268,10 @@ if __name__ == "__main__":
 
     @app.post("/g2p")
     def g2p(text: str):
-        return g2kata_tone(normalize_text(text))
+        # 長文で worker が落ちるケースがあるため、安全な分割版を使う
+        from style_bert_vits2.nlp.japanese.g2p_utils import g2kata_tone_safe
+
+        return g2kata_tone_safe(text)
 
     @app.get("/models/info")
     def get_loaded_models_info():

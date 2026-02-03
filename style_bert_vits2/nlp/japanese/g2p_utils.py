@@ -1,3 +1,5 @@
+import re
+
 from style_bert_vits2.nlp.japanese.g2p import g2p
 from style_bert_vits2.nlp.japanese.mora_list import (
     CONSONANTS,
@@ -21,6 +23,70 @@ def g2kata_tone(norm_text: str) -> list[tuple[str, int]]:
 
     phones, tones, _ = g2p(norm_text, use_jp_extra=True, raise_yomi_error=False)
     return phone_tone2kata_tone(list(zip(phones, tones)))
+
+
+def g2kata_tone_safe(
+    text: str,
+    *,
+    max_unit_chars: int = 300,
+) -> list[tuple[str, int]]:
+    """
+    長文でも worker を落としにくいように、内部で分割して g2kata_tone を実行する。
+
+    - 改行で分割し、さらに長い行は句読点・固定長で分割する
+    - 分割境界には「、」(tone=0) を挿入する（アクセント指定 UI 上の区切り用）
+    """
+
+    def split_long_segment(seg: str) -> list[str]:
+        seg = seg.strip()
+        if not seg:
+            return []
+        if len(seg) <= max_unit_chars:
+            return [seg]
+        parts = re.split(r"([。！？!?…]+)", seg)
+        merged: list[str] = []
+        buf = ""
+        for i in range(0, len(parts), 2):
+            piece = parts[i]
+            punct = parts[i + 1] if i + 1 < len(parts) else ""
+            chunk = (piece + punct).strip()
+            if not chunk:
+                continue
+            if not buf:
+                buf = chunk
+                continue
+            if len(buf) + len(chunk) <= max_unit_chars:
+                buf += chunk
+            else:
+                merged.append(buf)
+                buf = chunk
+        if buf:
+            merged.append(buf)
+
+        final: list[str] = []
+        for m in merged:
+            if len(m) <= max_unit_chars:
+                final.append(m)
+            else:
+                for j in range(0, len(m), max_unit_chars):
+                    s = m[j : j + max_unit_chars].strip()
+                    if s:
+                        final.append(s)
+        return final
+
+    lines = [ln for ln in text.split("\n") if ln.strip() != ""]
+    result: list[tuple[str, int]] = []
+    for li, line in enumerate(lines):
+        chunks = split_long_segment(line)
+        for ci, chunk in enumerate(chunks):
+            if result:
+                # 分割境界（改行・チャンク境界）を UI 上で分かるようにする
+                result.append(("、", 0))
+            result.extend(g2kata_tone(chunk))
+        if li < len(lines) - 1 and result:
+            # 行境界も区切る（チャンク境界で既に入っていれば重複するが UI 上の区切りとして許容）
+            result.append(("、", 0))
+    return result
 
 
 def phone_tone2kata_tone(phone_tone: list[tuple[str, int]]) -> list[tuple[str, int]]:

@@ -43,7 +43,7 @@ from style_bert_vits2.constants import (
 from style_bert_vits2.logging import logger
 from style_bert_vits2.nlp import bert_models, onnx_bert_models
 from style_bert_vits2.nlp.japanese import pyopenjtalk_worker as pyopenjtalk
-from style_bert_vits2.nlp.japanese.g2p_utils import g2kata_tone, kata_tone2phone_tone
+from style_bert_vits2.nlp.japanese.g2p_utils import g2kata_tone_safe, kata_tone2phone_tone
 from style_bert_vits2.nlp.japanese.normalizer import normalize_text
 from style_bert_vits2.nlp.japanese.user_dict import (
     apply_word,
@@ -242,8 +242,7 @@ class TextRequest(BaseModel):
 async def read_item(item: TextRequest):
     try:
         # 最初に正規化しないと整合性がとれない
-        text = normalize_text(item.text)
-        kata_tone_list = g2kata_tone(text)
+        kata_tone_list = g2kata_tone_safe(item.text)
     except Exception as e:
         raise HTTPException(
             status_code=400,

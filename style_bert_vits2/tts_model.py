@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import re
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -33,6 +34,83 @@ if TYPE_CHECKING:
     from style_bert_vits2.models.models_jp_extra import (
         SynthesizerTrn as SynthesizerTrnJPExtra,
     )
+
+
+def _split_text_to_infer_units(
+    raw_text: str,
+    *,
+    max_unit_chars: int,
+) -> list[tuple[str, int]]:
+    """
+    worker / 推論へ渡すテキストを安全な単位に分割する。
+
+    - 改行は必ず境界として扱う（改行回数を返して、後段で無音長へ変換できるようにする）
+    - 1行が長い場合は句読点等で追加分割する
+    - それでも長い場合は固定長で分割する
+
+    Returns:
+        list[tuple[str, int]]: (unit_text, newline_count_after_unit)
+    """
+
+    def split_long_segment(seg: str) -> list[str]:
+        seg = seg.strip()
+        if not seg:
+            return []
+        if len(seg) <= max_unit_chars:
+            return [seg]
+
+        # 文末・区切り記号で分割（区切り自体は前の文へ付ける）
+        parts = re.split(r"([。！？!?…]+)", seg)
+        merged: list[str] = []
+        buf = ""
+        for i in range(0, len(parts), 2):
+            piece = parts[i]
+            punct = parts[i + 1] if i + 1 < len(parts) else ""
+            chunk = (piece + punct).strip()
+            if not chunk:
+                continue
+            if not buf:
+                buf = chunk
+                continue
+            if len(buf) + len(chunk) <= max_unit_chars:
+                buf += chunk
+            else:
+                merged.append(buf)
+                buf = chunk
+        if buf:
+            merged.append(buf)
+
+        # 句読点分割でも長い塊が残る場合は固定長で分割
+        final: list[str] = []
+        for m in merged:
+            if len(m) <= max_unit_chars:
+                final.append(m)
+            else:
+                for j in range(0, len(m), max_unit_chars):
+                    s = m[j : j + max_unit_chars].strip()
+                    if s:
+                        final.append(s)
+        return final
+
+    tokens = re.split(r"(\n+)", raw_text)
+    units: list[tuple[str, int]] = []
+
+    # tokens は [text, newlines, text, newlines, ...] になりうる
+    for i in range(0, len(tokens), 2):
+        seg = tokens[i] if i < len(tokens) else ""
+        nl = len(tokens[i + 1]) if i + 1 < len(tokens) else 0
+
+        sub_units = split_long_segment(seg)
+        if not sub_units:
+            # seg が空でも、直前のテキストに紐づく改行はすでに処理済み（nl は seg の後ろの改行）
+            # seg 自体が空のときは無視する
+            continue
+
+        # 1行が分割された場合、最後のユニットに改行回数を付与する
+        for j, u in enumerate(sub_units):
+            units.append((u, nl if j == len(sub_units) - 1 else 0))
+
+    return units
 
 
 class NullModelParam(BaseModel):
@@ -447,8 +525,13 @@ class TTSModel:
                 self.load()
             assert self.net_g is not None
 
-            # 通常のテキストから音声を生成
-            if not line_split:
+            # worker クラッシュ回避のため、改行が含まれる場合や長文の場合は内部的に必ず分割して推論する
+            max_unit_chars = 300
+            should_split = (
+                line_split or ("\n" in text) or (len(text) > max_unit_chars)
+            )
+
+            if not should_split:
                 with torch.no_grad():
                     audio = infer(
                         text=text,
@@ -467,33 +550,43 @@ class TTSModel:
                         given_phone=given_phone,
                         given_tone=given_tone,
                     )
-
-            # 改行ごとに分割して音声を生成
             else:
-                texts = [t for t in text.split("\n") if t != ""]
-                audios = []
+                units = _split_text_to_infer_units(text, max_unit_chars=max_unit_chars)
+                if (given_phone is not None) or (given_tone is not None):
+                    logger.warning(
+                        "given_phone/given_tone are ignored because the text is split internally to avoid worker crash."
+                    )
+
+                audios: list[NDArray[Any]] = []
+                sr = int(self.hyper_parameters.data.sampling_rate)
                 with torch.no_grad():
-                    for i, t in enumerate(texts):
-                        audios.append(
-                            infer(
-                                text=t,
-                                sdp_ratio=sdp_ratio,
-                                noise_scale=noise,
-                                noise_scale_w=noise_w,
-                                length_scale=length,
-                                sid=speaker_id,
-                                language=language,
-                                hps=self.hyper_parameters,
-                                net_g=self.net_g,
-                                device=self.device,
-                                assist_text=assist_text,
-                                assist_text_weight=assist_text_weight,
-                                style_vec=style_vector,
-                            )
+                    for unit_text, newline_count_after in units:
+                        a = infer(
+                            text=unit_text,
+                            sdp_ratio=sdp_ratio,
+                            noise_scale=noise,
+                            noise_scale_w=noise_w,
+                            length_scale=length,
+                            sid=speaker_id,
+                            language=language,
+                            hps=self.hyper_parameters,
+                            net_g=self.net_g,
+                            device=self.device,
+                            assist_text=assist_text,
+                            assist_text_weight=assist_text_weight,
+                            style_vec=style_vector,
                         )
-                        if i != len(texts) - 1:
-                            audios.append(np.zeros(int(44100 * split_interval)))
-                    audio = np.concatenate(audios)
+                        audios.append(a)
+                        if newline_count_after > 0 and split_interval > 0:
+                            silence_len = int(sr * split_interval * newline_count_after)
+                            if silence_len > 0:
+                                audios.append(np.zeros(silence_len, dtype=a.dtype))
+
+                audio = (
+                    np.zeros(0, dtype=np.float32)
+                    if len(audios) == 0
+                    else np.concatenate(audios)
+                )
 
         # ONNX 推論時
         else:
@@ -508,8 +601,13 @@ class TTSModel:
                 self.load()
             assert self.onnx_session is not None
 
-            # 通常のテキストから音声を生成
-            if not line_split:
+            # worker クラッシュ回避のため、改行が含まれる場合や長文の場合は内部的に必ず分割して推論する
+            max_unit_chars = 300
+            should_split = (
+                line_split or ("\n" in text) or (len(text) > max_unit_chars)
+            )
+
+            if not should_split:
                 audio = infer_onnx(
                     text=text,
                     sdp_ratio=sdp_ratio,
@@ -527,32 +625,42 @@ class TTSModel:
                     given_phone=given_phone,
                     given_tone=given_tone,
                 )
-
-            # 改行ごとに分割して音声を生成
             else:
-                texts = [t for t in text.split("\n") if t != ""]
-                audios = []
-                for i, t in enumerate(texts):
-                    audios.append(
-                        infer_onnx(
-                            text=t,
-                            sdp_ratio=sdp_ratio,
-                            noise_scale=noise,
-                            noise_scale_w=noise_w,
-                            length_scale=length,
-                            sid=speaker_id,
-                            language=language,
-                            hps=self.hyper_parameters,
-                            onnx_session=self.onnx_session,
-                            onnx_providers=self.onnx_providers,
-                            assist_text=assist_text,
-                            assist_text_weight=assist_text_weight,
-                            style_vec=style_vector,
-                        )
+                units = _split_text_to_infer_units(text, max_unit_chars=max_unit_chars)
+                if (given_phone is not None) or (given_tone is not None):
+                    logger.warning(
+                        "given_phone/given_tone are ignored because the text is split internally to avoid worker crash."
                     )
-                    if i != len(texts) - 1:
-                        audios.append(np.zeros(int(44100 * split_interval)))
-                audio = np.concatenate(audios)
+
+                audios: list[NDArray[Any]] = []
+                sr = int(self.hyper_parameters.data.sampling_rate)
+                for unit_text, newline_count_after in units:
+                    a = infer_onnx(
+                        text=unit_text,
+                        sdp_ratio=sdp_ratio,
+                        noise_scale=noise,
+                        noise_scale_w=noise_w,
+                        length_scale=length,
+                        sid=speaker_id,
+                        language=language,
+                        hps=self.hyper_parameters,
+                        onnx_session=self.onnx_session,
+                        onnx_providers=self.onnx_providers,
+                        assist_text=assist_text,
+                        assist_text_weight=assist_text_weight,
+                        style_vec=style_vector,
+                    )
+                    audios.append(a)
+                    if newline_count_after > 0 and split_interval > 0:
+                        silence_len = int(sr * split_interval * newline_count_after)
+                        if silence_len > 0:
+                            audios.append(np.zeros(silence_len, dtype=a.dtype))
+
+                audio = (
+                    np.zeros(0, dtype=np.float32)
+                    if len(audios) == 0
+                    else np.concatenate(audios)
+                )
 
         logger.info(
             f"Audio data generated successfully ({time.time() - start_time:.2f}s)"

@@ -3,25 +3,56 @@ Run the pyopenjtalk worker in a separate process
 to avoid user dictionary access error
 """
 
+import socket
 from typing import Any, Optional
 
 from style_bert_vits2.logging import logger
 from style_bert_vits2.nlp.japanese.pyopenjtalk_worker.worker_client import WorkerClient
-from style_bert_vits2.nlp.japanese.pyopenjtalk_worker.worker_common import WORKER_PORT
+from style_bert_vits2.nlp.japanese.pyopenjtalk_worker.worker_common import (
+    ConnectionClosedException,
+    WORKER_PORT,
+)
 
 
 WORKER_CLIENT: Optional[WorkerClient] = None
+_WORKER_PORT: int = WORKER_PORT
 
 
 # pyopenjtalk interface
 # g2p(): not used
 
 
+def _restart_worker() -> None:
+    """Restart the worker process"""
+    global WORKER_CLIENT
+    logger.warning("Restarting pyopenjtalk worker...")
+    terminate_worker()
+    initialize_worker(_WORKER_PORT)
+
+
 def run_frontend(text: str) -> list[dict[str, Any]]:
     if WORKER_CLIENT is not None:
-        ret = WORKER_CLIENT.dispatch_pyopenjtalk("run_frontend", text)
-        assert isinstance(ret, list)
-        return ret
+        max_retries = 1
+        for attempt in range(max_retries + 1):
+            try:
+                ret = WORKER_CLIENT.dispatch_pyopenjtalk("run_frontend", text)
+                assert isinstance(ret, list)
+                return ret
+            except (
+                ConnectionClosedException,
+                BrokenPipeError,
+                ConnectionResetError,
+                OSError,
+                socket.error,
+            ) as e:
+                if attempt < max_retries:
+                    logger.warning(
+                        f"Worker connection error during run_frontend (attempt {attempt + 1}/{max_retries + 1}): {e}. Restarting worker..."
+                    )
+                    _restart_worker()
+                else:
+                    logger.error(f"Worker connection error after {max_retries + 1} attempts: {e}")
+                    raise
     else:
         # without worker
         import pyopenjtalk
@@ -31,9 +62,27 @@ def run_frontend(text: str) -> list[dict[str, Any]]:
 
 def make_label(njd_features: Any) -> list[str]:
     if WORKER_CLIENT is not None:
-        ret = WORKER_CLIENT.dispatch_pyopenjtalk("make_label", njd_features)
-        assert isinstance(ret, list)
-        return ret
+        max_retries = 1
+        for attempt in range(max_retries + 1):
+            try:
+                ret = WORKER_CLIENT.dispatch_pyopenjtalk("make_label", njd_features)
+                assert isinstance(ret, list)
+                return ret
+            except (
+                ConnectionClosedException,
+                BrokenPipeError,
+                ConnectionResetError,
+                OSError,
+                socket.error,
+            ) as e:
+                if attempt < max_retries:
+                    logger.warning(
+                        f"Worker connection error during make_label (attempt {attempt + 1}/{max_retries + 1}): {e}. Restarting worker..."
+                    )
+                    _restart_worker()
+                else:
+                    logger.error(f"Worker connection error after {max_retries + 1} attempts: {e}")
+                    raise
     else:
         # without worker
         import pyopenjtalk
@@ -43,7 +92,26 @@ def make_label(njd_features: Any) -> list[str]:
 
 def mecab_dict_index(path: str, out_path: str, dn_mecab: Optional[str] = None) -> None:
     if WORKER_CLIENT is not None:
-        WORKER_CLIENT.dispatch_pyopenjtalk("mecab_dict_index", path, out_path, dn_mecab)
+        max_retries = 1
+        for attempt in range(max_retries + 1):
+            try:
+                WORKER_CLIENT.dispatch_pyopenjtalk("mecab_dict_index", path, out_path, dn_mecab)
+                return
+            except (
+                ConnectionClosedException,
+                BrokenPipeError,
+                ConnectionResetError,
+                OSError,
+                socket.error,
+            ) as e:
+                if attempt < max_retries:
+                    logger.warning(
+                        f"Worker connection error during mecab_dict_index (attempt {attempt + 1}/{max_retries + 1}): {e}. Restarting worker..."
+                    )
+                    _restart_worker()
+                else:
+                    logger.error(f"Worker connection error after {max_retries + 1} attempts: {e}")
+                    raise
     else:
         # without worker
         import pyopenjtalk
@@ -53,7 +121,26 @@ def mecab_dict_index(path: str, out_path: str, dn_mecab: Optional[str] = None) -
 
 def update_global_jtalk_with_user_dict(path: str) -> None:
     if WORKER_CLIENT is not None:
-        WORKER_CLIENT.dispatch_pyopenjtalk("update_global_jtalk_with_user_dict", path)
+        max_retries = 1
+        for attempt in range(max_retries + 1):
+            try:
+                WORKER_CLIENT.dispatch_pyopenjtalk("update_global_jtalk_with_user_dict", path)
+                return
+            except (
+                ConnectionClosedException,
+                BrokenPipeError,
+                ConnectionResetError,
+                OSError,
+                socket.error,
+            ) as e:
+                if attempt < max_retries:
+                    logger.warning(
+                        f"Worker connection error during update_global_jtalk_with_user_dict (attempt {attempt + 1}/{max_retries + 1}): {e}. Restarting worker..."
+                    )
+                    _restart_worker()
+                else:
+                    logger.error(f"Worker connection error after {max_retries + 1} attempts: {e}")
+                    raise
     else:
         # without worker
         import pyopenjtalk
@@ -63,7 +150,26 @@ def update_global_jtalk_with_user_dict(path: str) -> None:
 
 def unset_user_dict() -> None:
     if WORKER_CLIENT is not None:
-        WORKER_CLIENT.dispatch_pyopenjtalk("unset_user_dict")
+        max_retries = 1
+        for attempt in range(max_retries + 1):
+            try:
+                WORKER_CLIENT.dispatch_pyopenjtalk("unset_user_dict")
+                return
+            except (
+                ConnectionClosedException,
+                BrokenPipeError,
+                ConnectionResetError,
+                OSError,
+                socket.error,
+            ) as e:
+                if attempt < max_retries:
+                    logger.warning(
+                        f"Worker connection error during unset_user_dict (attempt {attempt + 1}/{max_retries + 1}): {e}. Restarting worker..."
+                    )
+                    _restart_worker()
+                else:
+                    logger.error(f"Worker connection error after {max_retries + 1} attempts: {e}")
+                    raise
     else:
         # without worker
         import pyopenjtalk
@@ -81,7 +187,8 @@ def initialize_worker(port: int = WORKER_PORT) -> None:
     import sys
     import time
 
-    global WORKER_CLIENT
+    global WORKER_CLIENT, _WORKER_PORT
+    _WORKER_PORT = port
     if WORKER_CLIENT:
         return
 

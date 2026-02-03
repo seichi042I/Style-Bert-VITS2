@@ -21,7 +21,10 @@ from style_bert_vits2.constants import (
 from style_bert_vits2.logging import logger
 from style_bert_vits2.nlp import InvalidToneError
 from style_bert_vits2.nlp.japanese import pyopenjtalk_worker as pyopenjtalk
-from style_bert_vits2.nlp.japanese.g2p_utils import g2kata_tone, kata_tone2phone_tone
+from style_bert_vits2.nlp.japanese.g2p_utils import (
+    g2kata_tone_safe,
+    kata_tone2phone_tone,
+)
 from style_bert_vits2.nlp.japanese.normalizer import normalize_text
 from style_bert_vits2.tts_model import NullModelParam, TTSModelHolder
 from style_bert_vits2.utils import torch_device_to_onnx_providers
@@ -335,9 +338,13 @@ def create_inference_app(model_holder: TTSModelHolder) -> gr.Blocks:
 
         if tone is None and language == "JP":
             # アクセント指定に使えるようにアクセント情報を返す
-            norm_text = normalize_text(text)
-            kata_tone = g2kata_tone(norm_text)
-            kata_tone_json_str = json.dumps(kata_tone, ensure_ascii=False)
+            # 長文で worker が落ちるケースがあるため、安全な分割版を使う
+            try:
+                kata_tone = g2kata_tone_safe(text)
+                kata_tone_json_str = json.dumps(kata_tone, ensure_ascii=False)
+            except Exception as e:
+                logger.warning(f"Failed to generate kata_tone for UI: {e}")
+                kata_tone_json_str = ""
         elif tone is None:
             kata_tone_json_str = ""
         message = f"Success, time: {duration} seconds."
