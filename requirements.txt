@@ -27,7 +27,8 @@ pypinyin
 pyworld-prebuilt
 stable_ts
 tensorboard
-torch<2.4
-torchaudio<2.4
+torch>=2.4,<2.6
+torchaudio>=2.4,<2.6
 transformers
 umap-learn
+jaconv

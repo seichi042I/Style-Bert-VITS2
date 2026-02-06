@@ -22,10 +22,12 @@ def download_bert_models():
 
 def download_slm_model():
     local_path = Path("slm/wavlm-base-plus/")
-    file = "pytorch_model.bin"
-    if not Path(local_path).joinpath(file).exists():
-        logger.info(f"Downloading wavlm-base-plus {file}")
-        hf_hub_download("microsoft/wavlm-base-plus", file, local_dir=local_path)
+    local_path.mkdir(parents=True, exist_ok=True)
+    # config.json がないと transformers の from_pretrained が失敗する
+    for file in ["config.json", "pytorch_model.bin"]:
+        if not Path(local_path).joinpath(file).exists():
+            logger.info(f"Downloading wavlm-base-plus {file}")
+            hf_hub_download("microsoft/wavlm-base-plus", file, local_dir=local_path)
 
 
 def download_pretrained_models():

@@ -130,6 +130,9 @@ def run():
     backend = "nccl"
     if platform.system() == "Windows":
         backend = "gloo"  # If Windows,switch to gloo backend.
+    # WSL2 + single GPU: use gloo to avoid NCCL CUDA version mismatch
+    if "microsoft" in platform.release().lower() and int(os.environ.get("WORLD_SIZE", 1)) == 1:
+        backend = "gloo"
     dist.init_process_group(
         backend=backend,
         init_method="env://",
@@ -540,8 +543,12 @@ def run():
         scheduler_wd = torch.optim.lr_scheduler.LambdaLR(
             optim_wd, lr_lambda=lr_lambda, last_epoch=scheduler_last_epoch
         )
+        slm_model_path = hps.model.slm.model
+        if not os.path.isabs(slm_model_path):
+            _script_dir = os.path.dirname(os.path.abspath(__file__))
+            slm_model_path = os.path.normpath(os.path.join(_script_dir, slm_model_path))
         wl = WavLMLoss(
-            hps.model.slm.model,
+            slm_model_path,
             net_wd,
             hps.data.sampling_rate,
             hps.model.slm.sr,

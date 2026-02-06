@@ -11,6 +11,7 @@ from style_bert_vits2.nlp.japanese.pyopenjtalk_worker.worker_client import Worke
 from style_bert_vits2.nlp.japanese.pyopenjtalk_worker.worker_common import (
     ConnectionClosedException,
     WORKER_PORT,
+    suppress_pyopenjtalk_stderr,
 )
 
 
@@ -57,7 +58,8 @@ def run_frontend(text: str) -> list[dict[str, Any]]:
         # without worker
         import pyopenjtalk
 
-        return pyopenjtalk.run_frontend(text)
+        with suppress_pyopenjtalk_stderr():
+            return pyopenjtalk.run_frontend(text)
 
 
 def make_label(njd_features: Any) -> list[str]:
@@ -87,7 +89,8 @@ def make_label(njd_features: Any) -> list[str]:
         # without worker
         import pyopenjtalk
 
-        return pyopenjtalk.make_label(njd_features)
+        with suppress_pyopenjtalk_stderr():
+            return pyopenjtalk.make_label(njd_features)
 
 
 def mecab_dict_index(path: str, out_path: str, dn_mecab: Optional[str] = None) -> None:
@@ -116,7 +119,8 @@ def mecab_dict_index(path: str, out_path: str, dn_mecab: Optional[str] = None) -
         # without worker
         import pyopenjtalk
 
-        pyopenjtalk.mecab_dict_index(path, out_path, dn_mecab)
+        with suppress_pyopenjtalk_stderr():
+            pyopenjtalk.mecab_dict_index(path, out_path, dn_mecab)
 
 
 def update_global_jtalk_with_user_dict(path: str) -> None:
@@ -145,7 +149,8 @@ def update_global_jtalk_with_user_dict(path: str) -> None:
         # without worker
         import pyopenjtalk
 
-        pyopenjtalk.update_global_jtalk_with_user_dict(path)
+        with suppress_pyopenjtalk_stderr():
+            pyopenjtalk.update_global_jtalk_with_user_dict(path)
 
 
 def unset_user_dict() -> None:
@@ -174,7 +179,8 @@ def unset_user_dict() -> None:
         # without worker
         import pyopenjtalk
 
-        pyopenjtalk.unset_user_dict()
+        with suppress_pyopenjtalk_stderr():
+            pyopenjtalk.unset_user_dict()
 
 
 # initialize module when imported

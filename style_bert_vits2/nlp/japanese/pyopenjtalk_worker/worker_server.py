@@ -11,6 +11,7 @@ from style_bert_vits2.nlp.japanese.pyopenjtalk_worker.worker_common import (
     RequestType,
     receive_data,
     send_data,
+    suppress_pyopenjtalk_stderr,
 )
 
 
@@ -60,7 +61,8 @@ class WorkerServer:
                 kwargs = request.get("kwargs")
                 assert isinstance(args, list)
                 assert isinstance(kwargs, dict)
-                ret = func(*args, **kwargs)
+                with suppress_pyopenjtalk_stderr():
+                    ret = func(*args, **kwargs)
                 response = {"success": True, "return": ret}
             else:
                 # NOT REACHED

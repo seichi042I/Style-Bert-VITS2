@@ -1,6 +1,7 @@
 import os
 import random
 import sys
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -89,6 +90,8 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         )
         self.audiopaths_sid_text = audiopaths_sid_text_new
         self.lengths = lengths
+        # 話者名をインデックスごとに保持（バケットサンプラーの話者均等化に利用）
+        self.speakers = [x[1] for x in self.audiopaths_sid_text]
 
     def get_audio_text_speaker_pair(self, audiopath_sid_text):
         # separate filename, speaker_id and text
@@ -343,6 +346,8 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
         self.lengths = dataset.lengths
         self.batch_size = batch_size
         self.boundaries = boundaries
+        # 話者均等化: データセットが話者情報を持つ場合のみ使用
+        self.speakers = getattr(dataset, "speakers", None)
 
         self.buckets, self.num_samples_per_bucket = self._create_buckets()
         logger.info(f"Bucket info: {self.num_samples_per_bucket}")
@@ -387,13 +392,39 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
             num_samples_per_bucket.append(len_bucket + rem)
         return buckets, num_samples_per_bucket
 
+    def _round_robin_order(self, bucket: list) -> list:
+        """
+        バケット内のインデックスを話者でラウンドロビン（A,B,C,A,B,C,...）に並べ替える。
+        同一長さ帯からバッチを作る際に話者が均等に含まれるようにする。
+        """
+        if not bucket or self.speakers is None:
+            return list(range(len(bucket)))
+        # 話者ごとにバケット内の位置（bucket の何番目か）をグループ化
+        groups = defaultdict(list)
+        for pos in range(len(bucket)):
+            spk = self.speakers[bucket[pos]]
+            groups[spk].append(pos)
+        sorted_speakers = sorted(groups.keys())
+        # ラウンドロビンで並べた位置のリストを構築
+        result = []
+        max_len = max(len(groups[spk]) for spk in sorted_speakers)
+        for round_idx in range(max_len):
+            for spk in sorted_speakers:
+                if round_idx < len(groups[spk]):
+                    result.append(groups[spk][round_idx])
+        return result
+
     def __iter__(self):
         # deterministically shuffle based on epoch
         g = torch.Generator()
         g.manual_seed(self.epoch)
 
         indices = []
-        if self.shuffle:
+        if self.speakers is not None:
+            # 話者をラウンドロビンで均等化した順序を使用
+            for bucket in self.buckets:
+                indices.append(self._round_robin_order(bucket))
+        elif self.shuffle:
             for bucket in self.buckets:
                 indices.append(torch.randperm(len(bucket), generator=g).tolist())
         else:
