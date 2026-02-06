@@ -32,4 +32,4 @@ torchaudio<2.4
 transformers
 umap-learn
 jaconv
-pyopenjtalk
+pyopenjtalk-plus
