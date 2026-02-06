@@ -58,7 +58,15 @@ def process_line(x: tuple[str, bool]):
         bert = torch.load(bert_path)
         assert bert.shape[-1] == len(phone)
     except Exception:
-        bert = extract_bert_feature(text, word2ph, Languages(language_str), device)
+        try:
+            bert = extract_bert_feature(text, word2ph, Languages(language_str), device)
+        except ImportError as e:
+            if "PyTorch" in str(e) or "torch" in str(e).lower():
+                raise ImportError(
+                    f"BERT feature extraction failed: {e}. "
+                    "With PyTorch < 2.4, use transformers>=4.30,<4.46 (see requirements.txt)."
+                ) from e
+            raise
         assert bert.shape[-1] == len(phone)
         torch.save(bert, bert_path)
 
