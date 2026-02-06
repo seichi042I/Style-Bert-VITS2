@@ -50,9 +50,11 @@ def parse_transcript(transcript_path: Path) -> Dict[str, str]:
                 continue
 
             if ":" in line:
-                filename, text = line.split(":", 1)
-                filename_base = Path(filename.strip()).stem
-                transcript_map[filename_base] = text.strip()
+                parts = line.split(":", 2)
+                filename_base = Path(parts[0].strip()).stem
+                # 2列(filename:text)でも3列(filename:漢字かな:カタカナ)でも漢字かな交じり文のみ使う
+                text = parts[1].strip()
+                transcript_map[filename_base] = text
 
     return transcript_map
 
