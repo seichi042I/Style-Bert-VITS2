@@ -33,3 +33,4 @@ transformers
 umap-learn
 jaconv
 pyopenjtalk-plus
+huggingface-hub>=0.23.2,<1.0
