@@ -29,7 +29,7 @@ stable_ts
 tensorboard
 torch<2.4
 torchaudio<2.4
-transformers>=4.30,<4.46
+transformers
 umap-learn
 jaconv
 pyopenjtalk-plus
