@@ -27,10 +27,11 @@ pypinyin
 pyworld-prebuilt
 stable_ts
 tensorboard
-torch<2.4
-torchaudio<2.4
+torch>=2.8
+torchaudio
 transformers
 umap-learn
 jaconv
 pyopenjtalk-plus
 huggingface-hub>=0.23.2,<1.0
+soxr
