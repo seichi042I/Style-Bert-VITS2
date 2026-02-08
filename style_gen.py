@@ -37,8 +37,9 @@ import lightning_fabric.utilities.cloud_io as _cloud_io
 _orig_pl_load = _cloud_io._load
 
 
-def _patched_pl_load(path_or_url, map_location=None):
-    return torch.load(path_or_url, map_location=map_location, weights_only=False)
+def _patched_pl_load(path_or_url, map_location=None, **kwargs):
+    kwargs["weights_only"] = False
+    return torch.load(path_or_url, map_location=map_location, **kwargs)
 
 
 _cloud_io._load = _patched_pl_load
