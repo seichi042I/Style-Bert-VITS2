@@ -27,6 +27,12 @@ if hasattr(_hf_hub, "hf_hub_download"):
 
 import numpy as np
 import torch
+
+# PyTorch 2.6+ では torch.load の weights_only デフォルトが True になった。
+# pyannote-audio 3.x のチェックポイントには TorchVersion 等が含まれるため、
+# 安全なグローバルとして許可しておく。
+torch.serialization.add_safe_globals([torch.torch_version.TorchVersion])
+
 from numpy.typing import NDArray
 from pyannote.audio import Inference, Model
 from tqdm import tqdm
