@@ -28,10 +28,20 @@ if hasattr(_hf_hub, "hf_hub_download"):
 import numpy as np
 import torch
 
-# PyTorch 2.6+ では torch.load の weights_only デフォルトが True になった。
-# pyannote-audio 3.x のチェックポイントには TorchVersion 等が含まれるため、
-# 安全なグローバルとして許可しておく。
-torch.serialization.add_safe_globals([torch.torch_version.TorchVersion])
+# PyTorch 2.6+ で torch.load のデフォルトが weights_only=True に変更された。
+# pyannote-audio 3.x のチェックポイントには TorchVersion, Specifications 等
+# weights_only=True では許可されないオブジェクトが多数含まれる。
+# lightning_fabric の _load を直接パッチし weights_only=False で読み込む。
+import lightning_fabric.utilities.cloud_io as _cloud_io
+
+_orig_pl_load = _cloud_io._load
+
+
+def _patched_pl_load(path_or_url, map_location=None):
+    return torch.load(path_or_url, map_location=map_location, weights_only=False)
+
+
+_cloud_io._load = _patched_pl_load
 
 from numpy.typing import NDArray
 from pyannote.audio import Inference, Model
