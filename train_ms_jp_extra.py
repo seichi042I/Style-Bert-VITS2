@@ -49,6 +49,7 @@ torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(
     True
 )  # Not available if torch version is lower than 2.0
+torch.backends.cudnn.benchmark = True
 
 config = get_config()
 global_step = 0
@@ -104,6 +105,28 @@ def run():
         help="Don't use custom batch sampler for training, which was used in the version < 2.5",
         action="store_true",
     )
+    parser.add_argument(
+        "--cache_in_memory",
+        action="store_true",
+        help="Preload all training data into RAM to eliminate disk I/O bottlenecks.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=None,
+        help="Override batch size from config (e.g., 32 or 64 for large VRAM GPUs).",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=None,
+        help="Override number of DataLoader workers.",
+    )
+    parser.add_argument(
+        "--bf16",
+        action="store_true",
+        help="Enable BF16 mixed precision training (overrides config).",
+    )
     args = parser.parse_args()
 
     # Set log file
@@ -147,6 +170,34 @@ def run():
     hps.model_dir = model_dir
     hps.speedup = args.speedup
     hps.repo_id = args.repo_id
+
+    # Apply CLI overrides for high-performance training
+    if args.batch_size is not None:
+        logger.info(
+            f"Overriding batch_size: {hps.train.batch_size} -> {args.batch_size}"
+        )
+        hps.train.batch_size = args.batch_size
+    if args.bf16:
+        logger.info("Enabling BF16 mixed precision training via CLI flag")
+        hps.train.bf16_run = True
+
+    # Determine optimal num_workers for DataLoader
+    if args.num_workers is not None:
+        num_workers = args.num_workers
+    elif args.cache_in_memory:
+        # Data is in RAM; fewer workers needed (collation only)
+        num_workers = min(4, os.cpu_count() or 1)
+    else:
+        num_workers = min(
+            config.train_ms_config.num_workers, (os.cpu_count() or 1) // 2
+        )
+    prefetch_factor = 4 if num_workers > 0 else None
+
+    logger.info(
+        f"Training config: batch_size={hps.train.batch_size}, "
+        f"num_workers={num_workers}, prefetch_factor={prefetch_factor}, "
+        f"bf16={hps.train.bf16_run}, cache_in_memory={args.cache_in_memory}"
+    )
 
     # 比较路径是否相同
     if os.path.realpath(args.config) != os.path.realpath(
@@ -221,7 +272,9 @@ def run():
         utils.check_git_hash(model_dir)
         writer = SummaryWriter(log_dir=model_dir)
         writer_eval = SummaryWriter(log_dir=os.path.join(model_dir, "eval"))
-    train_dataset = TextAudioSpeakerLoader(hps.data.training_files, hps.data)
+    train_dataset = TextAudioSpeakerLoader(
+        hps.data.training_files, hps.data, cache_in_memory=args.cache_in_memory
+    )
     collate_fn = TextAudioSpeakerCollate(use_jp_extra=True)
     if not args.not_use_custom_batch_sampler:
         train_sampler = DistributedBucketSampler(
@@ -234,17 +287,13 @@ def run():
         )
         train_loader = DataLoader(
             train_dataset,
-            # メモリ消費量を減らそうとnum_workersを1にしてみる
-            # num_workers=min(config.train_ms_config.num_workers, os.cpu_count() // 2),
-            num_workers=1,
+            num_workers=num_workers,
             shuffle=False,
             pin_memory=True,
             collate_fn=collate_fn,
             batch_sampler=train_sampler,
-            # batch_size=hps.train.batch_size,
-            persistent_workers=True,
-            # これもメモリ消費量を減らそうとしてコメントアウト
-            # prefetch_factor=6,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=prefetch_factor,
         )
     else:
         train_sampler = DistributedLengthGroupedSampler(
@@ -257,17 +306,13 @@ def run():
         )
         train_loader = DataLoader(
             train_dataset,
-            # メモリ消費量を減らそうとnum_workersを1にしてみる
-            # num_workers=min(config.train_ms_config.num_workers, os.cpu_count() // 2),
-            num_workers=1,
-            # shuffle=True,
+            num_workers=num_workers,
             pin_memory=True,
             collate_fn=collate_fn,
             sampler=train_sampler,
             batch_size=hps.train.batch_size,
-            persistent_workers=True,
-            # これもメモリ消費量を減らそうとしてコメントアウト
-            # prefetch_factor=6,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=prefetch_factor,
         )
         logger.info("Using DistributedLengthGroupedSampler for training.")
         logger.debug(f"len(train_dataset): {len(train_dataset)}")
@@ -398,24 +443,24 @@ def run():
     net_g = DDP(
         net_g,
         device_ids=[local_rank],
-        # bucket_cap_mb=512
+        bucket_cap_mb=512,
     )
     net_d = DDP(
         net_d,
         device_ids=[local_rank],
-        # bucket_cap_mb=512
+        bucket_cap_mb=512,
     )
     if net_dur_disc is not None:
         net_dur_disc = DDP(
             net_dur_disc,
             device_ids=[local_rank],
-            # bucket_cap_mb=512,
+            bucket_cap_mb=512,
         )
     if net_wd is not None:
         net_wd = DDP(
             net_wd,
             device_ids=[local_rank],
-            #  bucket_cap_mb=512
+            bucket_cap_mb=512,
         )
 
     if utils.is_resuming(model_dir):

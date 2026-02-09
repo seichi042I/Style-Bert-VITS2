@@ -331,6 +331,9 @@ def train(
     use_jp_extra: bool = True,
     speedup: bool = False,
     not_use_custom_batch_sampler: bool = False,
+    cache_in_memory: bool = False,
+    bf16: bool = False,
+    num_workers: int = 0,
 ):
     paths = get_path(model_name)
     # 学習再開の場合を考えて念のためconfig.ymlの名前等を更新
@@ -355,6 +358,12 @@ def train(
         cmd.append("--speedup")
     if not_use_custom_batch_sampler:
         cmd.append("--not_use_custom_batch_sampler")
+    if cache_in_memory:
+        cmd.append("--cache_in_memory")
+    if bf16:
+        cmd.append("--bf16")
+    if num_workers > 0:
+        cmd.extend(["--num_workers", str(num_workers)])
     success, message = run_script_with_log(cmd, ignore_warning=True)
     if not success:
         logger.error("Train failed.")
@@ -734,6 +743,27 @@ def create_train_app():
                 value=False,
                 visible=False,  # Experimental
             )
+        with gr.Accordion("高速化オプション（GPUクラウド向け）", open=False):
+            with gr.Row():
+                cache_in_memory = gr.Checkbox(
+                    label="学習データをRAMにプリロード",
+                    info="大容量RAMがある環境向け。全データをRAMに読み込み、学習中のディスクI/Oを排除します",
+                    value=False,
+                )
+                bf16_train = gr.Checkbox(
+                    label="BF16混合精度学習",
+                    info="Ampere世代以降のGPU（A100, H100, B200等）で学習速度向上とVRAM使用量削減",
+                    value=False,
+                )
+                num_workers_train = gr.Slider(
+                    label="DataLoaderワーカー数",
+                    info="0で自動設定（RAMプリロード時: 4、通常時: CPU数の半分）。手動で指定する場合は1以上を設定",
+                    value=0,
+                    minimum=0,
+                    maximum=cpu_count(),
+                    step=1,
+                )
+        with gr.Row():
             train_btn = gr.Button(value="学習を開始する", variant="primary")
             tensorboard_btn = gr.Button(value="Tensorboardを開く")
         gr.Markdown(
@@ -822,6 +852,9 @@ def create_train_app():
                 use_jp_extra_train,
                 speedup,
                 not_use_custom_batch_sampler,
+                cache_in_memory,
+                bf16_train,
+                num_workers_train,
             ],
             outputs=[info_train],
         )

@@ -28,7 +28,12 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
     3) computes spectrograms from audio files.
     """
 
-    def __init__(self, audiopaths_sid_text: str, hparams: HyperParametersData):
+    def __init__(
+        self,
+        audiopaths_sid_text: str,
+        hparams: HyperParametersData,
+        cache_in_memory: bool = False,
+    ):
         self.audiopaths_sid_text = load_filepaths_and_text(audiopaths_sid_text)
         self.max_wav_value = hparams.max_wav_value
         self.sampling_rate = hparams.sampling_rate
@@ -55,6 +60,11 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         random.seed(1234)
         random.shuffle(self.audiopaths_sid_text)
         self._filter()
+
+        # In-memory cache: preload all samples to avoid disk I/O during training
+        self._cache = None
+        if cache_in_memory:
+            self._preload_to_memory()
 
     def _filter(self):
         """
@@ -198,7 +208,31 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         sid = torch.LongTensor([int(sid)])
         return sid
 
+    def _preload_to_memory(self):
+        """Preload all samples into RAM to eliminate disk I/O during training."""
+        n = len(self.audiopaths_sid_text)
+        logger.info(f"Preloading {n} samples into RAM...")
+        self._cache = [None] * n
+        for i in tqdm(
+            range(n), desc="Caching to RAM", file=sys.stdout, dynamic_ncols=True
+        ):
+            self._cache[i] = self.get_audio_text_speaker_pair(
+                self.audiopaths_sid_text[i]
+            )
+        # Estimate memory usage from first sample
+        sample = self._cache[0]
+        sample_bytes = sum(
+            t.nelement() * t.element_size() if isinstance(t, torch.Tensor) else 0
+            for t in sample
+        )
+        est_total_mb = sample_bytes * n / (1024 * 1024)
+        logger.info(
+            f"Preloaded {n} samples into RAM (estimated ~{est_total_mb:.0f} MB)"
+        )
+
     def __getitem__(self, index):
+        if self._cache is not None:
+            return self._cache[index]
         return self.get_audio_text_speaker_pair(self.audiopaths_sid_text[index])
 
     def __len__(self):
