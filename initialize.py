@@ -22,10 +22,12 @@ def download_bert_models():
 
 def download_slm_model():
     local_path = Path("slm/wavlm-base-plus/")
-    file = "pytorch_model.bin"
-    if not Path(local_path).joinpath(file).exists():
-        logger.info(f"Downloading wavlm-base-plus {file}")
-        hf_hub_download("microsoft/wavlm-base-plus", file, local_dir=local_path)
+    local_path.mkdir(parents=True, exist_ok=True)
+    # config.json がないと transformers の from_pretrained が失敗する
+    for file in ["config.json", "pytorch_model.bin"]:
+        if not Path(local_path).joinpath(file).exists():
+            logger.info(f"Downloading wavlm-base-plus {file}")
+            hf_hub_download("microsoft/wavlm-base-plus", file, local_dir=local_path)
 
 
 def download_pretrained_models():
@@ -52,18 +54,18 @@ def download_jp_extra_pretrained_models():
 
 def download_default_models():
     files = [
-        "jvnv-F1-jp/config.json",
-        "jvnv-F1-jp/jvnv-F1-jp_e160_s14000.safetensors",
-        "jvnv-F1-jp/style_vectors.npy",
-        "jvnv-F2-jp/config.json",
-        "jvnv-F2-jp/jvnv-F2_e166_s20000.safetensors",
-        "jvnv-F2-jp/style_vectors.npy",
-        "jvnv-M1-jp/config.json",
-        "jvnv-M1-jp/jvnv-M1-jp_e158_s14000.safetensors",
-        "jvnv-M1-jp/style_vectors.npy",
-        "jvnv-M2-jp/config.json",
-        "jvnv-M2-jp/jvnv-M2-jp_e159_s17000.safetensors",
-        "jvnv-M2-jp/style_vectors.npy",
+        # "jvnv-F1-jp/config.json",
+        # "jvnv-F1-jp/jvnv-F1-jp_e160_s14000.safetensors",
+        # "jvnv-F1-jp/style_vectors.npy",
+        # "jvnv-F2-jp/config.json",
+        # "jvnv-F2-jp/jvnv-F2_e166_s20000.safetensors",
+        # "jvnv-F2-jp/style_vectors.npy",
+        # "jvnv-M1-jp/config.json",
+        # "jvnv-M1-jp/jvnv-M1-jp_e158_s14000.safetensors",
+        # "jvnv-M1-jp/style_vectors.npy",
+        # "jvnv-M2-jp/config.json",
+        # "jvnv-M2-jp/jvnv-M2-jp_e159_s17000.safetensors",
+        # "jvnv-M2-jp/style_vectors.npy",
     ]
     for file in files:
         if not Path(f"model_assets/{file}").exists():
@@ -74,16 +76,16 @@ def download_default_models():
                 local_dir="model_assets",
             )
     additional_files = {
-        "litagin/sbv2_koharune_ami": [
-            "koharune-ami/config.json",
-            "koharune-ami/style_vectors.npy",
-            "koharune-ami/koharune-ami.safetensors",
-        ],
-        "litagin/sbv2_amitaro": [
-            "amitaro/config.json",
-            "amitaro/style_vectors.npy",
-            "amitaro/amitaro.safetensors",
-        ],
+        # "litagin/sbv2_koharune_ami": [
+        #     "koharune-ami/config.json",
+        #     "koharune-ami/style_vectors.npy",
+        #     "koharune-ami/koharune-ami.safetensors",
+        # ],
+        # "litagin/sbv2_amitaro": [
+        #     "amitaro/config.json",
+        #     "amitaro/style_vectors.npy",
+        #     "amitaro/amitaro.safetensors",
+        # ],
     }
     for repo_id, files in additional_files.items():
         for file in files:

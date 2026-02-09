@@ -42,11 +42,15 @@ def process_line(
     correct_path: bool,
     use_jp_extra: bool,
     yomi_error: str,
-):
+) -> str:
+    """
+    transcription の1行を処理する。4列（path|speaker|language|text）前提。
+    """
     splitted_line = line.strip().split("|")
     if len(splitted_line) != 4:
         raise ValueError(f"Invalid line format: {line.strip()}")
     utt, spk, language, text = splitted_line
+
     norm_text, phones, tones, word2ph = clean_text(
         text=text,
         language=language,  # type: ignore
@@ -93,7 +97,7 @@ def preprocess(
 
     total_lines = count_lines(transcription_path)
 
-    # transcription_path から 1行ずつ読み込んで文章処理して cleaned_path に書き込む
+    # transcription_path から 1行ずつ読み込んで文章処理して cleaned_path に書き込む（4列前提）
     with (
         transcription_path.open("r", encoding="utf-8") as trans_file,
         cleaned_path.open("w", encoding="utf-8") as out_file,

@@ -155,7 +155,9 @@ def text_to_sep_kata(
             assert word == "?", f"yomi `？` comes from: {word}"
             yomi = "?"
         sep_text.append(word)
-        sep_kata.append(yomi)
+        # 記号のみのセグメントでは OpenJTalk が全角（！など）を返すことがあるため、
+        # 正規化済みの word を sep_kata に渡す
+        sep_kata.append(word if set(word).issubset(set(PUNCTUATIONS)) else yomi)
 
     return sep_text, sep_kata
 

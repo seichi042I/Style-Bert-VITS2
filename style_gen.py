@@ -2,8 +2,48 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+# pyannote.audio が use_auth_token を渡すが、huggingface_hub は token に統一済み。
+# 互換のため、pyannote 読み込み前に hf_hub_download をパッチする。
+import huggingface_hub.file_download as _hf_file_download
+
+_orig_hf_hub_download = _hf_file_download.hf_hub_download
+
+
+def _patched_hf_hub_download(*args, **kwargs):
+    if "use_auth_token" in kwargs:
+        if "token" not in kwargs:
+            kwargs["token"] = kwargs.pop("use_auth_token")
+        else:
+            kwargs.pop("use_auth_token")
+    return _orig_hf_hub_download(*args, **kwargs)
+
+
+_hf_file_download.hf_hub_download = _patched_hf_hub_download
+# トップレベルから import している場合に備えて同じ参照を差し替える
+import huggingface_hub as _hf_hub
+
+if hasattr(_hf_hub, "hf_hub_download"):
+    _hf_hub.hf_hub_download = _patched_hf_hub_download
+
 import numpy as np
 import torch
+
+# PyTorch 2.6+ で torch.load のデフォルトが weights_only=True に変更された。
+# pyannote-audio 3.x のチェックポイントには TorchVersion, Specifications 等
+# weights_only=True では許可されないオブジェクトが多数含まれる。
+# lightning_fabric の _load を直接パッチし weights_only=False で読み込む。
+import lightning_fabric.utilities.cloud_io as _cloud_io
+
+_orig_pl_load = _cloud_io._load
+
+
+def _patched_pl_load(path_or_url, map_location=None, **kwargs):
+    kwargs["weights_only"] = False
+    return torch.load(path_or_url, map_location=map_location, **kwargs)
+
+
+_cloud_io._load = _patched_pl_load
+
 from numpy.typing import NDArray
 from pyannote.audio import Inference, Model
 from tqdm import tqdm

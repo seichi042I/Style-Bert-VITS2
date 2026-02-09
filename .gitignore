@@ -45,3 +45,9 @@ safetensors.ipynb
 
 playground.ipynb
 playgrounds/
+.deps/
+Data
+tests/test_phoneme_verify_cases_.txt
+tests/test_phoneme_verify_cases.txt
+log.txt
+tests/filterlog.txt
