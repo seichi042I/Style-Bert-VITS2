@@ -4,6 +4,9 @@ import gc
 import os
 import platform
 
+# Optimize CUDA memory allocator to reduce fragmentation with large batches
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 import torch.distributed as dist
 from huggingface_hub import HfApi
@@ -127,6 +130,11 @@ def run():
         action="store_true",
         help="Enable BF16 mixed precision training (overrides config).",
     )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Use torch.compile to optimize model execution (fuses kernels, reduces overhead).",
+    )
     args = parser.parse_args()
 
     # Set log file
@@ -185,18 +193,19 @@ def run():
     if args.num_workers is not None:
         num_workers = args.num_workers
     elif args.cache_in_memory:
-        # Data is in RAM; fewer workers needed (collation only)
-        num_workers = min(4, os.cpu_count() or 1)
+        # Data is in RAM; workers handle collation in parallel with GPU compute
+        num_workers = min(8, os.cpu_count() or 1)
     else:
         num_workers = min(
             config.train_ms_config.num_workers, (os.cpu_count() or 1) // 2
         )
-    prefetch_factor = 4 if num_workers > 0 else None
+    prefetch_factor = 8 if num_workers > 0 else None
 
     logger.info(
         f"Training config: batch_size={hps.train.batch_size}, "
         f"num_workers={num_workers}, prefetch_factor={prefetch_factor}, "
-        f"bf16={hps.train.bf16_run}, cache_in_memory={args.cache_in_memory}"
+        f"bf16={hps.train.bf16_run}, cache_in_memory={args.cache_in_memory}, "
+        f"compile={args.compile}"
     )
 
     # 比较路径是否相同
@@ -415,12 +424,14 @@ def run():
         hps.train.learning_rate,
         betas=hps.train.betas,
         eps=hps.train.eps,
+        fused=True,
     )
     optim_d = torch.optim.AdamW(
         net_d.parameters(),
         hps.train.learning_rate,
         betas=hps.train.betas,
         eps=hps.train.eps,
+        fused=True,
     )
     if net_dur_disc is not None:
         optim_dur_disc = torch.optim.AdamW(
@@ -428,6 +439,7 @@ def run():
             hps.train.learning_rate,
             betas=hps.train.betas,
             eps=hps.train.eps,
+            fused=True,
         )
     else:
         optim_dur_disc = None
@@ -437,30 +449,49 @@ def run():
             hps.train.learning_rate,
             betas=hps.train.betas,
             eps=hps.train.eps,
+            fused=True,
         )
     else:
         optim_wd = None
+
+    # torch.compile: fuse CUDA kernels to reduce launch overhead and improve GPU utilization
+    if getattr(args, "compile", False):
+        logger.info(
+            "Compiling models with torch.compile "
+            "(first iteration will be slow due to compilation)..."
+        )
+        net_g = torch.compile(net_g)
+        net_d = torch.compile(net_d)
+        if net_dur_disc is not None:
+            net_dur_disc = torch.compile(net_dur_disc)
+        if net_wd is not None:
+            net_wd = torch.compile(net_wd)
+
     net_g = DDP(
         net_g,
         device_ids=[local_rank],
         bucket_cap_mb=512,
+        gradient_as_bucket_view=True,
     )
     net_d = DDP(
         net_d,
         device_ids=[local_rank],
         bucket_cap_mb=512,
+        gradient_as_bucket_view=True,
     )
     if net_dur_disc is not None:
         net_dur_disc = DDP(
             net_dur_disc,
             device_ids=[local_rank],
             bucket_cap_mb=512,
+            gradient_as_bucket_view=True,
         )
     if net_wd is not None:
         net_wd = DDP(
             net_wd,
             device_ids=[local_rank],
             bucket_cap_mb=512,
+            gradient_as_bucket_view=True,
         )
 
     if utils.is_resuming(model_dir):
@@ -863,7 +894,7 @@ def train_and_evaluate(
                         losses_dur_disc_g,
                     ) = discriminator_loss(y_dur_hat_r, y_dur_hat_g)
                     loss_dur_disc_all = loss_dur_disc
-                optim_dur_disc.zero_grad()
+                optim_dur_disc.zero_grad(set_to_none=True)
                 scaler.scale(loss_dur_disc_all).backward()
                 scaler.unscale_(optim_dur_disc)
                 # torch.nn.utils.clip_grad_norm_(
@@ -881,14 +912,14 @@ def train_and_evaluate(
                         y.detach().squeeze(1), y_hat.detach().squeeze(1)
                     ).mean()
 
-                optim_wd.zero_grad()
+                optim_wd.zero_grad(set_to_none=True)
                 scaler.scale(loss_slm).backward()
                 scaler.unscale_(optim_wd)
                 # torch.nn.utils.clip_grad_norm_(parameters=net_wd.parameters(), max_norm=200)
                 grad_norm_wd = commons.clip_grad_value_(net_wd.parameters(), None)
                 scaler.step(optim_wd)
 
-        optim_d.zero_grad()
+        optim_d.zero_grad(set_to_none=True)
         scaler.scale(loss_disc_all).backward()
         scaler.unscale_(optim_d)
         if getattr(hps.train, "bf16_run", False):
@@ -920,7 +951,7 @@ def train_and_evaluate(
                         loss_gen_all += loss_dur_gen + loss_lm + loss_lm_gen
                     else:
                         loss_gen_all += loss_dur_gen
-        optim_g.zero_grad()
+        optim_g.zero_grad(set_to_none=True)
         scaler.scale(loss_gen_all).backward()
         scaler.unscale_(optim_g)
         # if getattr(hps.train, "bf16_run", False):

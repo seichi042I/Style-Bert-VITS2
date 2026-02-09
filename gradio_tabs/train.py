@@ -334,6 +334,7 @@ def train(
     cache_in_memory: bool = False,
     bf16: bool = False,
     num_workers: int = 0,
+    compile_model: bool = False,
 ):
     paths = get_path(model_name)
     # 学習再開の場合を考えて念のためconfig.ymlの名前等を更新
@@ -364,6 +365,8 @@ def train(
         cmd.append("--bf16")
     if num_workers > 0:
         cmd.extend(["--num_workers", str(num_workers)])
+    if compile_model:
+        cmd.append("--compile")
     success, message = run_script_with_log(cmd, ignore_warning=True)
     if not success:
         logger.error("Train failed.")
@@ -510,10 +513,10 @@ def create_train_app():
                 )
                 batch_size = gr.Slider(
                     label="バッチサイズ",
-                    info="学習速度が遅い場合は小さくして試し、VRAMに余裕があれば大きくしてください。JP-Extra版でのVRAM使用量目安: 1: 6GB, 2: 8GB, 3: 10GB, 4: 12GB",
+                    info="学習速度が遅い場合は小さくして試し、VRAMに余裕があれば大きくしてください。JP-Extra版でのVRAM使用量目安: 1: 6GB, 2: 8GB, 3: 10GB, 4: 12GB。クラウドGPU(A100/H100/B200等)では64〜256も可能",
                     value=2,
                     minimum=1,
-                    maximum=64,
+                    maximum=256,
                     step=1,
                 )
                 epochs = gr.Slider(
@@ -613,7 +616,7 @@ def create_train_app():
                         label="バッチサイズ",
                         value=2,
                         minimum=1,
-                        maximum=64,
+                        maximum=256,
                         step=1,
                     )
                     epochs_manual = gr.Slider(
@@ -740,8 +743,8 @@ def create_train_app():
             )
             speedup = gr.Checkbox(
                 label="ログ等をスキップして学習を高速化する",
+                info="Tensorboardログと評価をスキップし、学習スループットを最大化します",
                 value=False,
-                visible=False,  # Experimental
             )
         with gr.Accordion("高速化オプション（GPUクラウド向け）", open=False):
             with gr.Row():
@@ -755,9 +758,15 @@ def create_train_app():
                     info="Ampere世代以降のGPU（A100, H100, B200等）で学習速度向上とVRAM使用量削減",
                     value=False,
                 )
+                compile_train = gr.Checkbox(
+                    label="torch.compileでモデル最適化",
+                    info="CUDAカーネルを融合しGPU使用率を向上。初回イテレーションのみコンパイルで数分かかります",
+                    value=False,
+                )
+            with gr.Row():
                 num_workers_train = gr.Slider(
                     label="DataLoaderワーカー数",
-                    info="0で自動設定（RAMプリロード時: 4、通常時: CPU数の半分）。手動で指定する場合は1以上を設定",
+                    info="0で自動設定（RAMプリロード時: 8、通常時: CPU数の半分）。手動で指定する場合は1以上を設定",
                     value=0,
                     minimum=0,
                     maximum=cpu_count(),
@@ -855,6 +864,7 @@ def create_train_app():
                 cache_in_memory,
                 bf16_train,
                 num_workers_train,
+                compile_train,
             ],
             outputs=[info_train],
         )
