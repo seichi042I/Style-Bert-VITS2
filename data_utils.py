@@ -77,12 +77,43 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         audiopaths_sid_text_new = []
         lengths = []
         skipped = 0
+        skipped_reasons: dict[str, list[str]] = {
+            "missing_npy": [],
+            "nan_style_vec": [],
+            "missing_wav": [],
+        }
         logger.info("Init dataset...")
         for _id, spk, language, text, phones, tone, word2ph in tqdm(
             self.audiopaths_sid_text, file=sys.stdout, dynamic_ncols=True
         ):
             audiopath = f"{_id}"
-            # if self.min_text_len <= len(phones) and len(phones) <= self.max_text_len:
+
+            # wav ファイルの存在チェック
+            if not os.path.exists(audiopath):
+                skipped += 1
+                skipped_reasons["missing_wav"].append(audiopath)
+                continue
+
+            # style vector (.npy) の存在チェック
+            npy_path = f"{audiopath}.npy"
+            if not os.path.exists(npy_path):
+                skipped += 1
+                skipped_reasons["missing_npy"].append(audiopath)
+                continue
+
+            # style vector の NaN チェック
+            try:
+                style_vec = np.load(npy_path)
+                if np.isnan(style_vec).any():
+                    skipped += 1
+                    skipped_reasons["nan_style_vec"].append(audiopath)
+                    continue
+            except Exception as e:
+                logger.warning(f"Failed to load {npy_path}: {e}")
+                skipped += 1
+                skipped_reasons["missing_npy"].append(audiopath)
+                continue
+
             phones = phones.split(" ")
             tone = [int(i) for i in tone.split(" ")]
             word2ph = [int(i) for i in word2ph.split(" ")]
@@ -90,13 +121,12 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
                 [audiopath, spk, language, text, phones, tone, word2ph]
             )
             lengths.append(os.path.getsize(audiopath) // (2 * self.hop_length))
-            # else:
-            #     skipped += 1
+
+        for reason, paths in skipped_reasons.items():
+            if paths:
+                logger.warning(f"Skipped {len(paths)} entries ({reason}): {paths[:10]}{'...' if len(paths) > 10 else ''}")
         logger.info(
-            "skipped: "
-            + str(skipped)
-            + ", total: "
-            + str(len(self.audiopaths_sid_text))
+            f"skipped: {skipped}, total: {len(self.audiopaths_sid_text)}"
         )
         self.audiopaths_sid_text = audiopaths_sid_text_new
         self.lengths = lengths

@@ -1,5 +1,7 @@
 import argparse
+import os
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 
 # pyannote.audio が use_auth_token を渡すが、huggingface_hub は token に統一済み。
@@ -86,13 +88,28 @@ def save_style_vector(wav_path: str):
     np.save(f"{wav_path}.npy", style_vec)  # `test.wav` -> `test.wav.npy`
 
 
+def _remove_stale_npy(wav_path: str) -> None:
+    """以前の実行で残った .npy ファイルがあれば削除する。"""
+    npy_path = f"{wav_path}.npy"
+    if os.path.exists(npy_path):
+        try:
+            os.remove(npy_path)
+        except OSError as e:
+            logger.warning(f"Failed to remove stale npy file {npy_path}: {e}")
+
+
 def process_line(line: str):
     wav_path = line.split("|")[0]
     try:
         save_style_vector(wav_path)
         return line, None
     except NaNValueError:
+        _remove_stale_npy(wav_path)
         return line, "nan_error"
+    except Exception as e:
+        logger.error(f"Failed to generate style vector for {wav_path}: {e}")
+        _remove_stale_npy(wav_path)
+        return line, "error"
 
 
 if __name__ == "__main__":
@@ -111,55 +128,73 @@ if __name__ == "__main__":
 
     device = config.style_gen_config.device
 
-    training_lines: list[str] = []
-    with open(hps.data.training_files, encoding="utf-8") as f:
-        training_lines.extend(f.readlines())
-    with ThreadPoolExecutor(max_workers=num_processes) as executor:
-        training_results = list(
-            tqdm(
-                executor.map(process_line, training_lines),
-                total=len(training_lines),
-                file=SAFE_STDOUT,
-                dynamic_ncols=True,
+    def _process_split(
+        list_path: str, split_name: str
+    ) -> tuple[list[str], list[str]]:
+        """指定リストを処理し、(ok_lines, failed_wav_paths) を返す。"""
+        lines: list[str] = []
+        with open(list_path, encoding="utf-8") as f:
+            lines.extend(f.readlines())
+
+        with ThreadPoolExecutor(max_workers=num_processes) as executor:
+            results = list(
+                tqdm(
+                    executor.map(process_line, lines),
+                    total=len(lines),
+                    file=SAFE_STDOUT,
+                    dynamic_ncols=True,
+                )
             )
-        )
-    ok_training_lines = [line for line, error in training_results if error is None]
-    nan_training_lines = [
-        line for line, error in training_results if error == "nan_error"
-    ]
-    if nan_training_lines:
-        nan_files = [line.split("|")[0] for line in nan_training_lines]
-        logger.warning(
-            f"Found NaN value in {len(nan_training_lines)} files: {nan_files}, so they will be deleted from training data."
-        )
 
-    val_lines: list[str] = []
-    with open(hps.data.validation_files, encoding="utf-8") as f:
-        val_lines.extend(f.readlines())
+        ok_lines = [line for line, error in results if error is None]
+        nan_lines = [line for line, error in results if error == "nan_error"]
+        err_lines = [line for line, error in results if error == "error"]
+        failed_paths: list[str] = []
 
-    with ThreadPoolExecutor(max_workers=num_processes) as executor:
-        val_results = list(
-            tqdm(
-                executor.map(process_line, val_lines),
-                total=len(val_lines),
-                file=SAFE_STDOUT,
-                dynamic_ncols=True,
+        if nan_lines:
+            paths = [l.split("|")[0] for l in nan_lines]
+            failed_paths.extend(paths)
+            logger.warning(
+                f"[{split_name}] NaN style vectors in {len(nan_lines)} files — "
+                f"excluded from {split_name} data: {paths}"
             )
-        )
-    ok_val_lines = [line for line, error in val_results if error is None]
-    nan_val_lines = [line for line, error in val_results if error == "nan_error"]
-    if nan_val_lines:
-        nan_files = [line.split("|")[0] for line in nan_val_lines]
-        logger.warning(
-            f"Found NaN value in {len(nan_val_lines)} files: {nan_files}, so they will be deleted from validation data."
-        )
+        if err_lines:
+            paths = [l.split("|")[0] for l in err_lines]
+            failed_paths.extend(paths)
+            logger.warning(
+                f"[{split_name}] Failed to generate style vectors for {len(err_lines)} files — "
+                f"excluded from {split_name} data: {paths}"
+            )
 
+        return ok_lines, failed_paths
+
+    # ── training / validation それぞれ処理 ────────────────────────────
+    ok_training_lines, failed_training = _process_split(
+        hps.data.training_files, "train"
+    )
+    ok_val_lines, failed_val = _process_split(
+        hps.data.validation_files, "val"
+    )
+
+    # ── train.list / val.list を正常行のみで上書き ────────────────────
     with open(hps.data.training_files, "w", encoding="utf-8") as f:
         f.writelines(ok_training_lines)
-
     with open(hps.data.validation_files, "w", encoding="utf-8") as f:
         f.writelines(ok_val_lines)
 
-    ok_num = len(ok_training_lines) + len(ok_val_lines)
+    # ── 失敗した wav に対応する .bert.pt も削除（次ステップで再生成されないよう）
+    all_failed = set(failed_training + failed_val)
+    for wav_path in all_failed:
+        bert_path = wav_path.replace(".WAV", ".wav").replace(".wav", ".bert.pt")
+        if os.path.exists(bert_path):
+            try:
+                os.remove(bert_path)
+            except OSError as e:
+                logger.warning(f"Failed to remove stale bert file {bert_path}: {e}")
 
-    logger.info(f"Finished generating style vectors! total: {ok_num} npy files.")
+    ok_num = len(ok_training_lines) + len(ok_val_lines)
+    fail_num = len(all_failed)
+    logger.info(
+        f"Finished generating style vectors! "
+        f"ok: {ok_num}, excluded: {fail_num}"
+    )

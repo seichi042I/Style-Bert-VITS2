@@ -8,6 +8,18 @@ from style_bert_vits2.constants import DEFAULT_STYLE
 from style_bert_vits2.logging import logger
 
 
+def _load_npy_skip_nan(npy_files) -> list[np.ndarray]:
+    """Load .npy files, skipping any that contain NaN values."""
+    embs: list[np.ndarray] = []
+    for file in npy_files:
+        xvec = np.load(file)
+        if np.isnan(xvec).any():
+            logger.warning(f"Skipping {file}: contains NaN values")
+            continue
+        embs.append(np.expand_dims(xvec, axis=0))
+    return embs
+
+
 def save_neutral_vector(
     wav_dir: Union[Path, str],
     output_dir: Union[Path, str],
@@ -16,10 +28,7 @@ def save_neutral_vector(
 ):
     wav_dir = Path(wav_dir)
     output_dir = Path(output_dir)
-    embs = []
-    for file in wav_dir.rglob("*.npy"):
-        xvec = np.load(file)
-        embs.append(np.expand_dims(xvec, axis=0))
+    embs = _load_npy_skip_nan(wav_dir.rglob("*.npy"))
 
     x = np.concatenate(embs, axis=0)  # (N, 256)
     mean = np.mean(x, axis=0)  # (256,)
@@ -59,10 +68,11 @@ def save_styles_by_dirs(
         return
 
     # First get mean of all for Neutral
-    embs = []
-    for file in wav_dir.rglob("*.npy"):
-        xvec = np.load(file)
-        embs.append(np.expand_dims(xvec, axis=0))
+    embs = _load_npy_skip_nan(wav_dir.rglob("*.npy"))
+    if not embs:
+        logger.error("No valid .npy files found (all contain NaN or directory is empty)")
+        save_neutral_vector(wav_dir, output_dir, config_path, config_output_path)
+        return
     x = np.concatenate(embs, axis=0)  # (N, 256)
     mean = np.mean(x, axis=0)  # (256,)
     style_vectors = [mean]
@@ -72,10 +82,10 @@ def save_styles_by_dirs(
         npy_files = list(style_dir.rglob("*.npy"))
         if not npy_files:
             continue
-        embs = []
-        for file in npy_files:
-            xvec = np.load(file)
-            embs.append(np.expand_dims(xvec, axis=0))
+        embs = _load_npy_skip_nan(npy_files)
+        if not embs:
+            logger.warning(f"No valid .npy files in {style_dir} — skipping style")
+            continue
 
         x = np.concatenate(embs, axis=0)  # (N, 256)
         mean = np.mean(x, axis=0)  # (256,)
