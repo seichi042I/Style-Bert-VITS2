@@ -11,6 +11,7 @@ from gradio_tabs.inference import create_inference_app
 from gradio_tabs.merge import create_merge_app
 from gradio_tabs.style_vectors import create_style_vectors_app
 from gradio_tabs.train import create_train_app
+from gradio_tabs.user_dict import create_user_dict_app
 from style_bert_vits2.constants import GRADIO_THEME, VERSION
 from style_bert_vits2.nlp.japanese import pyopenjtalk_worker
 from style_bert_vits2.nlp.japanese.user_dict import update_dict
@@ -54,6 +55,8 @@ with gr.Blocks(theme=GRADIO_THEME) as app:
     with gr.Tabs():
         with gr.Tab("音声合成"):
             create_inference_app(model_holder=model_holder)
+        with gr.Tab("ユーザー辞書"):
+            create_user_dict_app()
         with gr.Tab("データセット作成"):
             create_dataset_app()
         with gr.Tab("学習"):
@@ -70,4 +73,5 @@ app.launch(
     server_port=args.port,
     inbrowser=not args.no_autolaunch,
     share=args.share,
+    allowed_paths=[str(Path(path_config.dataset_root).resolve())],
 )

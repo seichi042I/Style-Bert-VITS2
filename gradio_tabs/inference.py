@@ -265,10 +265,24 @@ def create_inference_app(model_holder: TTSModelHolder) -> gr.Blocks:
         intonation_scale,
         null_models: dict[int, NullModelParam],
         force_reload_model: bool,
+        progress=gr.Progress(),
     ):
+        progress(0, desc="モデルを準備中...")
         model_holder.get_model(model_name, model_path)
         assert model_holder.current_model is not None
         logger.debug(f"Null models setting: {null_models}")
+
+        # BERTモデル・トークナイザーの事前ロード（初回は時間がかかるため進捗を表示）
+        from style_bert_vits2.nlp import bert_models
+
+        lang = Languages(language)
+        if not bert_models.is_tokenizer_loaded(lang):
+            progress(0.1, desc="BERTトークナイザーをロード中...")
+            bert_models.load_tokenizer(lang)
+        if not bert_models.is_model_loaded(lang):
+            progress(0.2, desc="BERTモデルをロード中（初回は数分かかります）...")
+            bert_models.load_model(lang, device_map=model_holder.device)
+            bert_models.transfer_model(lang, model_holder.device)
 
         wrong_tone_message = ""
         kata_tone: Optional[list[tuple[str, int]]] = None
@@ -302,6 +316,8 @@ def create_inference_app(model_holder: TTSModelHolder) -> gr.Blocks:
         speaker_id = model_holder.current_model.spk2id[speaker]
 
         start_time = datetime.datetime.now()
+
+        progress(0.5, desc="音声を生成中...")
 
         try:
             sr, audio = model_holder.current_model.infer(
@@ -347,6 +363,7 @@ def create_inference_app(model_holder: TTSModelHolder) -> gr.Blocks:
                 kata_tone_json_str = ""
         elif tone is None:
             kata_tone_json_str = ""
+        progress(1.0, desc="完了")
         message = f"Success, time: {duration} seconds."
         if wrong_tone_message != "":
             message = wrong_tone_message + "\n" + message

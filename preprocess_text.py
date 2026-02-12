@@ -1,28 +1,18 @@
 import argparse
 import json
+import multiprocessing
 from collections import defaultdict
+from functools import partial
 from pathlib import Path
 from random import sample
 from typing import Optional
 
 from tqdm import tqdm
 
-from config import get_config
 from style_bert_vits2.logging import logger
 from style_bert_vits2.nlp import clean_text
-from style_bert_vits2.nlp.japanese import pyopenjtalk_worker
 from style_bert_vits2.nlp.japanese.user_dict import update_dict
 from style_bert_vits2.utils.stdout_wrapper import SAFE_STDOUT
-
-
-# このプロセスからはワーカーを起動して辞書を使いたいので、ここで初期化
-pyopenjtalk_worker.initialize_worker()
-
-# dict_data/ 以下の辞書データを pyopenjtalk に適用
-update_dict()
-
-
-preprocess_text_config = get_config().preprocess_text_config
 
 
 # Count lines for tqdm
@@ -34,6 +24,31 @@ def count_lines(file_path: Path):
 def write_error_log(error_log_path: Path, line: str, error: Exception):
     with error_log_path.open("a", encoding="utf-8") as error_log:
         error_log.write(f"{line.strip()}\n{error}\n\n")
+
+
+def _pool_worker_init():
+    """multiprocessing.Pool のワーカープロセス初期化関数。
+    spawn コンテキストで起動されるため、pyopenjtalk_worker は使わず
+    直接 pyopenjtalk を利用してユーザー辞書を適用する。
+    """
+    update_dict()
+
+
+def _process_line_safe(
+    line: str,
+    transcription_path: Path,
+    correct_path: bool,
+    use_jp_extra: bool,
+    yomi_error: str,
+) -> tuple[bool, Optional[str], Optional[str], Optional[str]]:
+    """process_line のラッパー。例外を捕捉して (success, result, line, error_msg) を返す。"""
+    try:
+        result = process_line(
+            line, transcription_path, correct_path, use_jp_extra, yomi_error
+        )
+        return (True, result, None, None)
+    except Exception as e:
+        return (False, None, line, str(e))
 
 
 def process_line(
@@ -83,6 +98,7 @@ def preprocess(
     use_jp_extra: bool,
     yomi_error: str,
     correct_path: bool,
+    num_processes: int = 1,
 ):
     assert yomi_error in ["raise", "skip", "use"]
     if cleaned_path == "" or cleaned_path is None:
@@ -95,31 +111,68 @@ def preprocess(
         error_log_path.unlink()
     error_count = 0
 
-    total_lines = count_lines(transcription_path)
+    # transcription_path から全行を読み込む
+    lines = list(transcription_path.open("r", encoding="utf-8"))
+    total_lines = len(lines)
 
     # transcription_path から 1行ずつ読み込んで文章処理して cleaned_path に書き込む（4列前提）
-    with (
-        transcription_path.open("r", encoding="utf-8") as trans_file,
-        cleaned_path.open("w", encoding="utf-8") as out_file,
-    ):
-        for line in tqdm(
-            trans_file, file=SAFE_STDOUT, total=total_lines, dynamic_ncols=True
+    if num_processes > 1:
+        # 並列処理: spawn コンテキストで各ワーカーが直接 pyopenjtalk を利用する
+        logger.info(f"Processing text with {num_processes} processes...")
+        ctx = multiprocessing.get_context("spawn")
+        worker_fn = partial(
+            _process_line_safe,
+            transcription_path=transcription_path,
+            correct_path=correct_path,
+            use_jp_extra=use_jp_extra,
+            yomi_error=yomi_error,
+        )
+        chunksize = max(1, total_lines // (num_processes * 4))
+        with (
+            cleaned_path.open("w", encoding="utf-8") as out_file,
+            ctx.Pool(num_processes, initializer=_pool_worker_init) as pool,
         ):
-            try:
-                processed_line = process_line(
-                    line,
-                    transcription_path,
-                    correct_path,
-                    use_jp_extra,
-                    yomi_error,
-                )
-                out_file.write(processed_line)
-            except Exception as e:
-                logger.error(
-                    f"An error occurred at line:\n{line.strip()}\n{e}", encoding="utf-8"
-                )
-                write_error_log(error_log_path, line, e)
-                error_count += 1
+            for success, result, err_line, err_msg in tqdm(
+                pool.imap(worker_fn, lines, chunksize=chunksize),
+                file=SAFE_STDOUT,
+                total=total_lines,
+                dynamic_ncols=True,
+            ):
+                if success:
+                    out_file.write(result)
+                else:
+                    logger.error(
+                        f"An error occurred at line:\n{err_line.strip()}\n{err_msg}",
+                        encoding="utf-8",
+                    )
+                    write_error_log(
+                        error_log_path, err_line, Exception(err_msg)
+                    )
+                    error_count += 1
+    else:
+        # 逐次処理（従来の動作）
+        with (
+            cleaned_path.open("w", encoding="utf-8") as out_file,
+        ):
+            for line in tqdm(
+                lines, file=SAFE_STDOUT, total=total_lines, dynamic_ncols=True
+            ):
+                try:
+                    processed_line = process_line(
+                        line,
+                        transcription_path,
+                        correct_path,
+                        use_jp_extra,
+                        yomi_error,
+                    )
+                    out_file.write(processed_line)
+                except Exception as e:
+                    logger.error(
+                        f"An error occurred at line:\n{line.strip()}\n{e}",
+                        encoding="utf-8",
+                    )
+                    write_error_log(error_log_path, line, e)
+                    error_count += 1
 
     transcription_path = cleaned_path
 
@@ -222,6 +275,17 @@ def preprocess(
 
 
 if __name__ == "__main__":
+    from config import get_config
+    from style_bert_vits2.nlp.japanese import pyopenjtalk_worker
+
+    # このプロセスからはワーカーを起動して辞書を使いたいので、ここで初期化
+    pyopenjtalk_worker.initialize_worker()
+
+    # dict_data/ 以下の辞書データを pyopenjtalk に適用
+    update_dict()
+
+    preprocess_text_config = get_config().preprocess_text_config
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--transcription-path", default=preprocess_text_config.transcription_path
@@ -242,6 +306,12 @@ if __name__ == "__main__":
     parser.add_argument("--use_jp_extra", action="store_true")
     parser.add_argument("--yomi_error", default="raise")
     parser.add_argument("--correct_path", action="store_true")
+    parser.add_argument(
+        "--num_processes",
+        type=int,
+        default=1,
+        help="Number of parallel processes for text preprocessing.",
+    )
 
     args = parser.parse_args()
 
@@ -255,6 +325,7 @@ if __name__ == "__main__":
     use_jp_extra: bool = args.use_jp_extra
     yomi_error: str = args.yomi_error
     correct_path: bool = args.correct_path
+    num_processes: int = args.num_processes
 
     preprocess(
         transcription_path=transcription_path,
@@ -267,4 +338,5 @@ if __name__ == "__main__":
         use_jp_extra=use_jp_extra,
         yomi_error=yomi_error,
         correct_path=correct_path,
+        num_processes=num_processes,
     )

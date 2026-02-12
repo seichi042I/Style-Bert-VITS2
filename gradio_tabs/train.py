@@ -165,7 +165,11 @@ def resample(model_name: str, normalize: bool, trim: bool, num_processes: int):
 
 
 def preprocess_text(
-    model_name: str, use_jp_extra: bool, val_per_lang: int, yomi_error: str
+    model_name: str,
+    use_jp_extra: bool,
+    val_per_lang: int,
+    yomi_error: str,
+    num_processes: int = 1,
 ):
     logger.info("Step 3: start preprocessing text...")
     paths = get_path(model_name)
@@ -191,6 +195,8 @@ def preprocess_text(
         "--yomi_error",
         yomi_error,
         "--correct_path",  # 音声ファイルのパスを正しいパスに修正する
+        "--num_processes",
+        str(num_processes),
     ]
     if use_jp_extra:
         cmd.append("--use_jp_extra")
@@ -211,11 +217,17 @@ def preprocess_text(
     return True, "Step 3, Success: 書き起こしファイルの前処理が完了しました"
 
 
-def bert_gen(model_name: str):
+def bert_gen(model_name: str, num_processes: int = 1):
     logger.info("Step 4: start bert_gen...")
     config_path = get_path(model_name).config_path
     success, message = run_script_with_log(
-        ["bert_gen.py", "--config", str(config_path)]
+        [
+            "bert_gen.py",
+            "--config",
+            str(config_path),
+            "--num_processes",
+            str(num_processes),
+        ]
     )
     if not success:
         logger.error("Step 4: bert_gen failed.")
@@ -307,12 +319,14 @@ def preprocess_all(
         use_jp_extra=use_jp_extra,
         val_per_lang=val_per_lang,
         yomi_error=yomi_error,
+        num_processes=num_processes,
     )
     if not success:
         return False, message
     success, message = bert_gen(
-        model_name=model_name
-    )  # bert_genは重いのでプロセス数いじらない
+        model_name=model_name,
+        num_processes=num_processes,
+    )
     if not success:
         return False, message
     success, message = style_gen(model_name=model_name, num_processes=num_processes)
@@ -687,6 +701,14 @@ def create_train_app():
             with gr.Row(variant="panel"):
                 with gr.Column():
                     gr.Markdown(value="#### Step 3: 書き起こしファイルの前処理")
+                    num_processes_text = gr.Slider(
+                        label="プロセス数",
+                        info="テキスト前処理時の並列処理プロセス数",
+                        value=cpu_count() // 2,
+                        minimum=1,
+                        maximum=cpu_count(),
+                        step=1,
+                    )
                     val_per_lang_manual = gr.Slider(
                         label="検証データ数",
                         value=0,
@@ -709,6 +731,14 @@ def create_train_app():
             with gr.Row(variant="panel"):
                 with gr.Column():
                     gr.Markdown(value="#### Step 4: BERT特徴ファイルの生成")
+                    num_processes_bert = gr.Slider(
+                        label="スレッド数",
+                        info="BERT特徴生成時の並列スレッド数（GPU使用時はVRAMに注意）",
+                        value=cpu_count() // 2,
+                        minimum=1,
+                        maximum=cpu_count(),
+                        step=1,
+                    )
                 with gr.Column():
                     bert_gen_btn = gr.Button(value="実行", variant="primary")
                     info_bert = gr.Textbox(label="状況")
@@ -838,12 +868,13 @@ def create_train_app():
                 use_jp_extra_manual,
                 val_per_lang_manual,
                 yomi_error_manual,
+                num_processes_text,
             ],
             outputs=[info_preprocess_text],
         )
         bert_gen_btn.click(
             second_elem_of(bert_gen),
-            inputs=[model_name],
+            inputs=[model_name, num_processes_bert],
             outputs=[info_bert],
         )
         style_gen_btn.click(

@@ -13,13 +13,17 @@ if __name__ == "__main__":
     if str(_root) not in sys.path:
         sys.path.insert(0, str(_root))
 
-from style_bert_vits2.nlp.japanese.g2p import g2p
 from style_bert_vits2.nlp.japanese.normalizer import normalize_text
 from tests.support.case_loader import load_cases
 
 
 def get_phoneme_sequence(text: str) -> list[str]:
     """テキストを正規化し、g2p で音素列を取得する。"""
+    # g2p は bert_models を含む重量級モジュールを読み込むため遅延インポートする。
+    # ProcessPoolExecutor ワーカーなど g2p を使わない文脈でこのモジュールを
+    # インポートした際に不要なロードを防ぐ。
+    from style_bert_vits2.nlp.japanese.g2p import g2p
+
     norm_text = normalize_text(text)
     phones, _, _ = g2p(norm_text, use_jp_extra=True, raise_yomi_error=False)
     return phones
@@ -51,6 +55,20 @@ def get_phoneme_mismatch_count(seq_kanji: list[str], seq_kata: list[str]) -> int
             if previous_phoneme == "o" and seg_kanji and seg_kata and seg_kanji[-1] == "o" and seg_kata[-1] == "u":
                 continue
             if previous_phoneme == "e" and seg_kanji and seg_kata and seg_kanji[-1] == "e" and seg_kata[-1] == "i":
+                continue
+            # 拗音の分離 (ky → k i y 等) は無視
+            if (
+                len(seg_kanji) == 1
+                and len(seg_kanji[0]) == 2
+                and seg_kanji[0].endswith("y")
+                and seg_kata == [seg_kanji[0][0], "i", "y"]
+            ):
+                continue
+            # i → y u (拗長音の表記揺れ) は無視
+            if seg_kanji == ["i"] and seg_kata == ["y", "u"]:
+                continue
+            # ts u → q (促音の表記揺れ) は無視
+            if seg_kanji == ["ts", "u"] and seg_kata == ["q"]:
                 continue
             count += 1
         elif tag == "delete":
@@ -88,6 +106,20 @@ def format_phoneme_diff(seq_kanji: list[str], seq_kata: list[str]) -> tuple[list
             if previous_phoneme == "o" and seg_kanji and seg_kata and seg_kanji[-1] == "o" and seg_kata[-1] == "u":
                 continue
             if previous_phoneme == "e" and seg_kanji and seg_kata and seg_kanji[-1] == "e" and seg_kata[-1] == "i":
+                continue
+            # 拗音の分離 (ky → k i y 等) は無視
+            if (
+                len(seg_kanji) == 1
+                and len(seg_kanji[0]) == 2
+                and seg_kanji[0].endswith("y")
+                and seg_kata == [seg_kanji[0][0], "i", "y"]
+            ):
+                continue
+            # i → y u (拗長音の表記揺れ) は無視
+            if seg_kanji == ["i"] and seg_kata == ["y", "u"]:
+                continue
+            # ts u → q (促音の表記揺れ) は無視
+            if seg_kanji == ["ts", "u"] and seg_kata == ["q"]:
                 continue
             mismatch_count += 1
             lines.append(f"  差異: {' '.join(seg_kanji)}  -->  {' '.join(seg_kata)}")

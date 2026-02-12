@@ -78,8 +78,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "-c", "--config", type=str, default=config.bert_gen_config.config_path
     )
+    parser.add_argument(
+        "--num_processes",
+        type=int,
+        default=1,
+        help="Number of parallel threads for BERT feature generation.",
+    )
     args, _ = parser.parse_known_args()
     config_path = args.config
+    num_processes: int = args.num_processes
     hps = HyperParameters.load_from_json(config_path)
     lines: list[str] = []
     with open(hps.data.training_files, encoding="utf-8") as f:
@@ -90,8 +97,6 @@ if __name__ == "__main__":
     add_blank = [hps.data.add_blank] * len(lines)
 
     if len(lines) != 0:
-        # pyopenjtalkの別ワーカー化により、並列処理でエラーがでる模様なので、一旦シングルスレッド強制にする
-        num_processes = 1
         with ThreadPoolExecutor(max_workers=num_processes) as executor:
             _ = list(
                 tqdm(
