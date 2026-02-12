@@ -798,7 +798,7 @@ def create_user_dict_app() -> gr.Blocks:
                         p = f"{spk}/{fb}.wav".replace("\\", "/")
                         esd_entries.append((p, spk, text))
 
-                write_esd_list(output_model_dir, esd_entries, language)
+                write_esd_list(output_model_dir / "esd.list", esd_entries, language)
                 progress(1.0, desc="変換完了")
 
                 summary = (
@@ -866,7 +866,12 @@ def create_user_dict_app() -> gr.Blocks:
                     1 for fb in t_map if fb in raw_a_map
                 )
                 create_esd_list(
-                    output_model_dir, t_map, raw_a_map, spk, language
+                    output_model_dir / "esd.list",
+                    raw_dir,
+                    t_map,
+                    raw_a_map,
+                    spk,
+                    language,
                 )
                 progress(1.0, desc="変換完了")
 
