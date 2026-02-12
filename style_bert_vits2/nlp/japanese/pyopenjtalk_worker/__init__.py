@@ -222,11 +222,14 @@ def make_label(njd_features: Any) -> list[str]:
     return ret
 
 
-# Dictionary operations – broadcast to all workers.
+# Dictionary operations.
+# mecab_dict_index: ディスク上の辞書ファイルを生成するだけなので 1 台で十分。
+# unset_user_dict / update_global_jtalk_with_user_dict: 各サーバープロセスの
+#   メモリ上の辞書を操作するため全ワーカーへのブロードキャストが必要。
 
 
 def mecab_dict_index(path: str, out_path: str, dn_mecab: Optional[str] = None) -> None:
-    _broadcast("mecab_dict_index", path, out_path, dn_mecab)
+    _dispatch("mecab_dict_index", path, out_path, dn_mecab)
 
 
 def update_global_jtalk_with_user_dict(path: str) -> None:
