@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import gc
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Union, cast
 
 from transformers import (
+    AutoConfig,
     AutoModelForMaskedLM,
     AutoTokenizer,
     DebertaV2Model,
@@ -41,6 +43,84 @@ __loaded_tokenizers: dict[
     Languages,
     Union[PreTrainedTokenizer, PreTrainedTokenizerFast, DebertaV2TokenizerFast],
 ] = {}
+
+
+def _load_pretrained_fast(
+    language: Languages,
+    pretrained_model_name_or_path: str,
+    *,
+    device_map: Optional[
+        Union[str, dict[str, Union[int, str, "torch.device"]], int, "torch.device"]
+    ] = None,
+    cache_dir: Optional[str] = None,
+    revision: str = "main",
+) -> Union[PreTrainedModel, DebertaV2Model]:
+    """from_pretrained の高速代替。
+
+    transformers >= 4.50 では from_pretrained 内部で accelerate の
+    init_empty_weights() が常に有効となり、全パラメータがメタデバイス上に
+    作成された後テンソル単位で個別ロードされる。1.2 GB クラスのモデルで
+    数分かかる原因となるため、ローカルの単一ファイル（pytorch_model.bin /
+    model.safetensors）が存在する場合は通常のインスタンス化 + state_dict
+    一括適用で高速にロードする。
+
+    該当ファイルが見つからない場合（sharded / リモート等）は従来の
+    from_pretrained にフォールバックする。
+    """
+
+    import torch
+
+    model_dir = Path(pretrained_model_name_or_path)
+    pt_path = model_dir / "pytorch_model.bin"
+    sf_path = model_dir / "model.safetensors"
+
+    can_fast_load = model_dir.is_dir() and (pt_path.exists() or sf_path.exists())
+
+    if not can_fast_load:
+        # sharded / リモートモデルは従来の from_pretrained にフォールバック
+        logger.debug("Fast-load unavailable, falling back to from_pretrained")
+        if language == Languages.EN:
+            return cast(
+                DebertaV2Model,
+                DebertaV2Model.from_pretrained(
+                    pretrained_model_name_or_path,
+                    device_map=device_map,
+                    cache_dir=cache_dir,
+                    revision=revision,
+                ),
+            )
+        else:
+            return AutoModelForMaskedLM.from_pretrained(
+                pretrained_model_name_or_path,
+                device_map=device_map,
+                cache_dir=cache_dir,
+                revision=revision,
+            )
+
+    # --- 高速パス: 通常インスタンス化 + state_dict 一括適用 ---
+    config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
+
+    # モデルを実メモリ上にインスタンス化（meta device を使わない）
+    if language == Languages.EN:
+        model: Union[PreTrainedModel, DebertaV2Model] = DebertaV2Model(config)
+    else:
+        model = AutoModelForMaskedLM.from_config(config)
+
+    # state_dict を一括ロード
+    if sf_path.exists():
+        from safetensors.torch import load_file
+
+        state_dict = load_file(str(sf_path))
+    else:
+        state_dict = torch.load(str(pt_path), map_location="cpu", weights_only=False)
+
+    # strict=False: tied weights（lm_head.weight 等）が state_dict に
+    # 含まれない場合があるため
+    model.load_state_dict(state_dict, strict=False)
+    model.tie_weights()
+    model.eval()
+
+    return model
 
 
 def load_model(
@@ -92,23 +172,13 @@ def load_model(
     # BERT モデルをロードし、辞書に格納して返す
     ## 英語のみ DebertaV2Model でロードする必要がある
     start_time = time.time()
-    if language == Languages.EN:
-        __loaded_models[language] = cast(
-            DebertaV2Model,
-            DebertaV2Model.from_pretrained(
-                pretrained_model_name_or_path,
-                device_map=device_map,
-                cache_dir=cache_dir,
-                revision=revision,
-            ),
-        )
-    else:
-        __loaded_models[language] = AutoModelForMaskedLM.from_pretrained(
-            pretrained_model_name_or_path,
-            device_map=device_map,
-            cache_dir=cache_dir,
-            revision=revision,
-        )
+    __loaded_models[language] = _load_pretrained_fast(
+        language,
+        pretrained_model_name_or_path,
+        device_map=device_map,
+        cache_dir=cache_dir,
+        revision=revision,
+    )
     logger.info(
         f"Loaded the {language.name} BERT model from {pretrained_model_name_or_path} ({time.time() - start_time:.2f}s)"
     )
