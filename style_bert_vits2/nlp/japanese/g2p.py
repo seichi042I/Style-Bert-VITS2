@@ -683,11 +683,6 @@ def __align_tones(
             # phone が punctuation の場合 → (phone, 0) を追加
             result.append((phone, 0))
         else:
-            logger.debug(f"phones: {phones_with_punct}")
-            logger.debug(f"phone_tone_list: {phone_tone_list}")
-            logger.debug(f"result: {result}")
-            logger.debug(f"tone_index: {tone_index}")
-            logger.debug(f"phone: {phone}")
             raise ValueError(f"Unexpected phone: {phone}")
 
     return result

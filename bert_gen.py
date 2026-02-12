@@ -17,11 +17,8 @@ from style_bert_vits2.utils.stdout_wrapper import SAFE_STDOUT
 
 
 config = get_config()
-# このプロセスからはワーカーを起動して辞書を使いたいので、ここで初期化
-pyopenjtalk_worker.initialize_worker()
-
-# dict_data/ 以下の辞書データを pyopenjtalk に適用
-update_dict()
+# ワーカーの初期化と辞書適用は if __name__ ブロック内で行う
+# (num_processes に合わせて並列ワーカーを起動するため)
 
 
 def process_line(x: tuple[str, bool]):
@@ -87,6 +84,11 @@ if __name__ == "__main__":
     args, _ = parser.parse_known_args()
     config_path = args.config
     num_processes: int = args.num_processes
+
+    # num_processes 分のワーカーサーバーを起動し、辞書を全ワーカーに適用
+    pyopenjtalk_worker.initialize_worker(num_workers=num_processes)
+    update_dict()
+
     hps = HyperParameters.load_from_json(config_path)
     lines: list[str] = []
     with open(hps.data.training_files, encoding="utf-8") as f:
