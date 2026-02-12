@@ -15,10 +15,13 @@
     python convert_data_format.py --model_name my_model --language JP
 
 引数:
+    --input_dirpath: 入力用Data相当ディレクトリ（デフォルト: スクリプト所在/Data）
     --model_name: モデル名（Data/配下のディレクトリ名）
     --speaker_name: 話者名（単一話者時のみ。デフォルト: モデル名）
     --language: 言語ID（JP/EN/ZH、デフォルト: JP）
     --filter-phoneme-match: 音素マッチするケースのみ変換する（JP のみ）
+
+出力は常に Data/raw と Data/esd.list に固定される。
 """
 
 import argparse
@@ -152,7 +155,7 @@ def get_speaker_subdirs(
 
 
 def write_esd_list(
-    model_dir: Path,
+    esd_list_path: Path,
     entries: List[Tuple[str, str, str]],
     language: str,
 ) -> None:
@@ -160,7 +163,7 @@ def write_esd_list(
     (path_str, speaker_name, text) のリストから esd.list を書き出す。
     複数話者用。フォーマット: path|speaker|language|text（4列）
     """
-    esd_list_path = model_dir / "esd.list"
+    esd_list_path.parent.mkdir(parents=True, exist_ok=True)
     with open(esd_list_path, "w", encoding="utf-8") as f:
         for path_str, speaker_name, text in entries:
             f.write(f"{path_str}|{speaker_name}|{language}|{text}\n")
@@ -168,7 +171,8 @@ def write_esd_list(
 
 
 def create_esd_list(
-    model_dir: Path,
+    esd_list_path: Path,
+    raw_dir: Path,
     transcript_map: Dict[str, str],
     raw_audio_map: Dict[str, Path],
     speaker_name: str,
@@ -179,19 +183,19 @@ def create_esd_list(
     フォーマット: path|speaker|language|text（4列）
 
     Args:
-        model_dir: モデルディレクトリのパス
+        esd_list_path: esd.list の出力パス
+        raw_dir: raw ディレクトリのパス
         transcript_map: ファイル名ベース -> 書き起こしテキストのマッピング
         raw_audio_map: raw/ディレクトリ内の音声ファイルのマッピング（ファイル名ベース -> パス）
         speaker_name: 話者名
         language: 言語ID
     """
-    esd_list_path = model_dir / "esd.list"
-    raw_dir = model_dir / "raw"
 
     missing = [fb for fb in transcript_map if fb not in raw_audio_map]
     if missing:
         _warn_missing_audio(speaker_name, missing, raw_audio_map)
 
+    esd_list_path.parent.mkdir(parents=True, exist_ok=True)
     with open(esd_list_path, "w", encoding="utf-8") as f:
         for filename_base, text in sorted(transcript_map.items()):
             if filename_base not in raw_audio_map:
@@ -257,6 +261,12 @@ def main():
         description='音声データと書き起こしテキストをStyle-Bert-VITS2のフォーマットに変換'
     )
     parser.add_argument(
+        '--input_dirpath',
+        type=str,
+        default=None,
+        help='入力用Data相当ディレクトリ（デフォルト: スクリプト所在/Data）'
+    )
+    parser.add_argument(
         '--model_name',
         type=str,
         required=True,
@@ -300,14 +310,15 @@ def main():
         sys.exit(1)
 
     base_dir = Path(__file__).parent
-    data_dir = base_dir / "Data"
-    model_dir = data_dir / args.model_name
+    input_data_dir = Path(args.input_dirpath) if args.input_dirpath else base_dir / "Data"
+    model_dir = input_data_dir / args.model_name
 
     if not model_dir.exists():
         print(f"エラー: モデルディレクトリが見つかりません: {model_dir}")
         return
 
-    raw_dir = model_dir / "raw"
+    output_raw_dir = base_dir / "Data" / "raw"
+    output_esd_list_path = base_dir / "Data" / "esd.list"
     speaker_dirs = get_speaker_subdirs(
         model_dir, args.transcript_file, args.audio_dir
     )
@@ -338,7 +349,7 @@ def main():
                 print("intersection size:", len(set(audio_map.keys()) & set(transcript_map.keys())))
                 audio_map = {k: v for k, v in audio_map.items() if k in transcript_map}
             print(f"  音声ファイル数: {len(audio_map)}")
-            raw_speaker_dir = raw_dir / speaker_name
+            raw_speaker_dir = output_raw_dir / speaker_name
             print(f"  音声を {raw_speaker_dir} にコピー中...")
             raw_audio_map = copy_audio_files(
                 audio_dir_path, raw_speaker_dir, audio_map
@@ -356,7 +367,7 @@ def main():
                 path_str = path_str.replace("\\", "/")
                 esd_entries.append((path_str, speaker_name, text))
         print(f"\nesd.listを作成中...")
-        write_esd_list(model_dir, esd_entries, args.language)
+        write_esd_list(output_esd_list_path, esd_entries, args.language)
     else:
         # 単一話者: モデルディレクトリ直下に transcript と wav/
         speaker_name = args.speaker_name if args.speaker_name else args.model_name
@@ -388,19 +399,25 @@ def main():
             print("intersection size:", len(set(audio_map.keys()) & set(transcript_map.keys())))
             audio_map = {k: v for k, v in audio_map.items() if k in transcript_map}
         print(f"音声ファイル数: {len(audio_map)}")
-        print(f"\n音声ファイルを{raw_dir}にコピー中...")
+        raw_speaker_dir = output_raw_dir / speaker_name
+        print(f"\n音声ファイルを{raw_speaker_dir}にコピー中...")
         raw_audio_map = copy_audio_files(
-            audio_dir_path, raw_dir, audio_map
+            audio_dir_path, raw_speaker_dir, audio_map
         )
         print(f"\nesd.listを作成中...")
         create_esd_list(
-            model_dir, transcript_map, raw_audio_map, speaker_name, args.language
+            output_esd_list_path,
+            output_raw_dir,
+            transcript_map,
+            raw_audio_map,
+            speaker_name,
+            args.language,
         )
 
     print("\n変換が完了しました！")
-    print(f"モデルディレクトリ: {model_dir}")
-    print(f"raw/ディレクトリ: {raw_dir}")
-    print(f"esd.list: {model_dir / 'esd.list'}")
+    print(f"入力モデルディレクトリ: {model_dir}")
+    print(f"raw/ディレクトリ: {output_raw_dir}")
+    print(f"esd.list: {output_esd_list_path}")
 
 
 if __name__ == '__main__':

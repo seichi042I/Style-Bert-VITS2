@@ -689,6 +689,7 @@ def create_user_dict_app() -> gr.Blocks:
         model_name: str | None,
         speaker_name: str,
         language: str,
+        input_dirpath: str,
         progress: gr.Progress = gr.Progress(),
     ) -> tuple[str, str]:
         """convert_data_format のロジックを音素マッチングフィルタ付きで実行する。
@@ -696,23 +697,38 @@ def create_user_dict_app() -> gr.Blocks:
         言語が JP の場合、音素マッチング検証と同じフィルタ
         (_get_phones_light + is_effective_match) を適用し、
         有効と判定されたケースのみを変換対象とする。
+
+        input_dirpath が指定された場合、入力データはそのディレクトリから
+        読み込み、出力はデフォルトの dataset_root 配下に書き出す。
         """
         if not model_name:
             return "変換対象のモデル名を選択してください。", ""
 
-        data_dir = _get_dataset_root()
-        model_dir = data_dir / model_name
+        if input_dirpath and input_dirpath.strip():
+            input_data_dir = Path(input_dirpath.strip())
+            if not input_data_dir.is_dir():
+                return (
+                    f"入力ディレクトリが見つかりません: {input_data_dir}",
+                    "",
+                )
+        else:
+            input_data_dir = _get_dataset_root()
 
-        if not model_dir.is_dir():
-            return f"モデルディレクトリが見つかりません: {model_dir}", ""
+        input_model_dir = input_data_dir / model_name
+        if not input_model_dir.is_dir():
+            return (
+                f"モデルディレクトリが見つかりません: {input_model_dir}",
+                "",
+            )
 
-        raw_dir = model_dir / "raw"
+        output_model_dir = _get_dataset_root() / model_name
+        raw_dir = output_model_dir / "raw"
         transcript_file = "transcript_utf8.txt"
         audio_dir_name = "wav"
         apply_filter = language == "JP"
 
         speaker_dirs = get_speaker_subdirs(
-            model_dir, transcript_file, audio_dir_name
+            input_model_dir, transcript_file, audio_dir_name
         )
 
         log_lines: list[str] = []
@@ -727,7 +743,7 @@ def create_user_dict_app() -> gr.Blocks:
                 total_filtered = 0
 
                 for spk in speaker_dirs:
-                    spk_path = model_dir / spk
+                    spk_path = input_model_dir / spk
                     t_path = spk_path / transcript_file
                     a_path = spk_path / audio_dir_name
 
@@ -782,7 +798,7 @@ def create_user_dict_app() -> gr.Blocks:
                         p = f"{spk}/{fb}.wav".replace("\\", "/")
                         esd_entries.append((p, spk, text))
 
-                write_esd_list(model_dir, esd_entries, language)
+                write_esd_list(output_model_dir, esd_entries, language)
                 progress(1.0, desc="変換完了")
 
                 summary = (
@@ -794,8 +810,10 @@ def create_user_dict_app() -> gr.Blocks:
                     summary += f"  音素一致: {total_filtered} 件\n"
                 summary += (
                     f"  esd.list エントリ: {len(esd_entries)} 件\n"
-                    f"  出力: {model_dir / 'esd.list'}"
+                    f"  出力: {output_model_dir / 'esd.list'}"
                 )
+                if input_data_dir != _get_dataset_root():
+                    summary += f"\n  入力元: {input_model_dir}"
             else:
                 # ---------- 単一話者モード ----------
                 spk = (
@@ -803,14 +821,14 @@ def create_user_dict_app() -> gr.Blocks:
                     if speaker_name and speaker_name.strip()
                     else model_name
                 )
-                t_path = model_dir / transcript_file
+                t_path = input_model_dir / transcript_file
                 if not t_path.exists():
                     return (
                         f"書き起こしファイルが見つかりません: {t_path}",
                         "",
                     )
 
-                a_path = model_dir / audio_dir_name
+                a_path = input_model_dir / audio_dir_name
                 if not a_path.is_dir():
                     return (
                         f"音声ディレクトリが見つかりません: {a_path}",
@@ -848,7 +866,7 @@ def create_user_dict_app() -> gr.Blocks:
                     1 for fb in t_map if fb in raw_a_map
                 )
                 create_esd_list(
-                    model_dir, t_map, raw_a_map, spk, language
+                    output_model_dir, t_map, raw_a_map, spk, language
                 )
                 progress(1.0, desc="変換完了")
 
@@ -862,8 +880,10 @@ def create_user_dict_app() -> gr.Blocks:
                     summary += f"  音素一致: {len(t_map)} 件\n"
                 summary += (
                     f"  esd.list エントリ: {esd_count} 件\n"
-                    f"  出力: {model_dir / 'esd.list'}"
+                    f"  出力: {output_model_dir / 'esd.list'}"
                 )
+                if input_data_dir != _get_dataset_root():
+                    summary += f"\n  入力元: {input_model_dir}"
 
         except Exception as e:
             return (
@@ -876,6 +896,17 @@ def create_user_dict_app() -> gr.Blocks:
 
         detail_text = "\n".join(log_lines) if log_lines else ""
         return summary, detail_text
+
+    def _refresh_convert_models(input_dirpath: str):
+        """入力ディレクトリに応じてモデル名候補を更新する。"""
+        if input_dirpath and input_dirpath.strip():
+            d = Path(input_dirpath.strip())
+        else:
+            d = _get_dataset_root()
+        if not d.is_dir():
+            return gr.update(choices=[], value=None)
+        models = sorted(dd.name for dd in d.iterdir() if dd.is_dir())
+        return gr.update(choices=models, value=None)
 
     # ------------------------------------------------------------------
     # UI レイアウト
@@ -1156,6 +1187,11 @@ def create_user_dict_app() -> gr.Blocks:
                 "変換後は `raw/` ディレクトリに音声がコピーされ、"
                 "`esd.list` が生成されます。"
             )
+            convert_input_dir = gr.Textbox(
+                label="入力ディレクトリ（空欄でデフォルトの Data ディレクトリを使用）",
+                placeholder="例: /path/to/custom/Data",
+                value="",
+            )
             with gr.Row():
                 convert_model_name = gr.Dropdown(
                     label="モデル名",
@@ -1248,12 +1284,19 @@ def create_user_dict_app() -> gr.Blocks:
             outputs=[verify_summary, mismatch_data],
         )
 
+        convert_input_dir.change(
+            fn=_refresh_convert_models,
+            inputs=[convert_input_dir],
+            outputs=[convert_model_name],
+        )
+
         convert_btn.click(
             fn=run_convert_data_format,
             inputs=[
                 convert_model_name,
                 convert_speaker_name,
                 convert_language,
+                convert_input_dir,
             ],
             outputs=[convert_summary, convert_detail],
         )
