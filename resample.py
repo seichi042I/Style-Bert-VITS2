@@ -16,6 +16,7 @@ from style_bert_vits2.utils.stdout_wrapper import SAFE_STDOUT
 
 
 DEFAULT_BLOCK_SIZE: float = 0.400  # seconds
+MIN_AUDIO_DURATION: float = 0.75  # seconds
 
 
 class BlockSizeException(Exception):
@@ -61,6 +62,12 @@ def resample(
                 )
         if trim:
             wav, _ = librosa.effects.trim(wav, top_db=30)
+        duration = len(wav) / sr
+        if duration < MIN_AUDIO_DURATION:
+            logger.info(
+                f"Skip due to short duration ({duration:.2f}s < {MIN_AUDIO_DURATION}s): {file}"
+            )
+            return
         relative_path = file.relative_to(input_dir)
         # ここで拡張子が.wav以外でも.wavに置き換えられる
         output_path = output_dir / relative_path.with_suffix(".wav")
