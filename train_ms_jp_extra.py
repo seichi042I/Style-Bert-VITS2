@@ -1,6 +1,5 @@
 import argparse
 import datetime
-import gc
 import os
 import platform
 from concurrent.futures import ThreadPoolExecutor
@@ -730,6 +729,8 @@ def run():
         if net_wd is not None:
             scheduler_wd.step()
         if epoch == hps.train.epochs:
+            # Flush any pending async checkpoint saves before the final save.
+            _ckpt_save_pool.shutdown(wait=True)
             # Save the final models
             assert optim_g is not None
             utils.checkpoints.save_checkpoint(
@@ -1099,68 +1100,72 @@ def train_and_evaluate(
             ):
                 if not hps.speedup:
                     evaluate(hps, net_g, eval_loader, writer_eval)
-                utils.checkpoints.save_checkpoint(
-                    net_g,
-                    optim_g,
-                    hps.train.learning_rate,
-                    epoch,
-                    os.path.join(hps.model_dir, f"G_{global_step}.pth"),
-                )
-                utils.checkpoints.save_checkpoint(
-                    net_d,
-                    optim_d,
-                    hps.train.learning_rate,
-                    epoch,
-                    os.path.join(hps.model_dir, f"D_{global_step}.pth"),
-                )
-                if net_dur_disc is not None:
+                # Async checkpoint save: serialization + disk I/O runs in
+                # a background thread so the next training step can start
+                # immediately.  max_workers=1 on the pool ensures saves
+                # are serialized (no concurrent model state access).
+                # Capture loop-varying values for the closure.
+                _step = global_step
+                _epoch = epoch
+                _lr = hps.train.learning_rate
+                _model_dir = hps.model_dir
+                _keep = config.train_ms_config.keep_ckpts
+                _repo_id = hps.repo_id
+                _out_dir = config.out_dir
+                _model_name = config.model_name
+                _dataset_path = config.dataset_path
+
+                def _do_save(
+                    step=_step, ep=_epoch, lr=_lr, mdir=_model_dir,
+                    keep=_keep, rid=_repo_id, odir=_out_dir,
+                    mname=_model_name, dpath=_dataset_path,
+                ):
                     utils.checkpoints.save_checkpoint(
-                        net_dur_disc,
-                        optim_dur_disc,
-                        hps.train.learning_rate,
-                        epoch,
-                        os.path.join(hps.model_dir, f"DUR_{global_step}.pth"),
+                        net_g, optim_g, lr, ep,
+                        os.path.join(mdir, f"G_{step}.pth"),
                     )
-                if net_wd is not None:
                     utils.checkpoints.save_checkpoint(
-                        net_wd,
-                        optim_wd,
-                        hps.train.learning_rate,
-                        epoch,
-                        os.path.join(hps.model_dir, f"WD_{global_step}.pth"),
+                        net_d, optim_d, lr, ep,
+                        os.path.join(mdir, f"D_{step}.pth"),
                     )
-                keep_ckpts = config.train_ms_config.keep_ckpts
-                if keep_ckpts > 0:
-                    utils.checkpoints.clean_checkpoints(
-                        model_dir_path=hps.model_dir,
-                        n_ckpts_to_keep=keep_ckpts,
-                        sort_by_time=True,
+                    if net_dur_disc is not None:
+                        utils.checkpoints.save_checkpoint(
+                            net_dur_disc, optim_dur_disc, lr, ep,
+                            os.path.join(mdir, f"DUR_{step}.pth"),
+                        )
+                    if net_wd is not None:
+                        utils.checkpoints.save_checkpoint(
+                            net_wd, optim_wd, lr, ep,
+                            os.path.join(mdir, f"WD_{step}.pth"),
+                        )
+                    if keep > 0:
+                        utils.checkpoints.clean_checkpoints(
+                            model_dir_path=mdir,
+                            n_ckpts_to_keep=keep,
+                            sort_by_time=True,
+                        )
+                    utils.safetensors.save_safetensors(
+                        net_g, ep,
+                        os.path.join(odir, f"{mname}_e{ep}_s{step}.safetensors"),
+                        for_infer=True,
                     )
-                # Save safetensors (for inference) to `model_assets/{model_name}`
-                utils.safetensors.save_safetensors(
-                    net_g,
-                    epoch,
-                    os.path.join(
-                        config.out_dir,
-                        f"{config.model_name}_e{epoch}_s{global_step}.safetensors",
-                    ),
-                    for_infer=True,
-                )
-                if hps.repo_id is not None:
-                    api.upload_folder(
-                        repo_id=hps.repo_id,
-                        folder_path=config.dataset_path,
-                        path_in_repo=f"Data/{config.model_name}",
-                        delete_patterns="*.pth",  # Only keep the latest checkpoint
-                        ignore_patterns=f"{config.dataset_path}/raw",  # Ignore raw data
-                        run_as_future=True,
-                    )
-                    api.upload_folder(
-                        repo_id=hps.repo_id,
-                        folder_path=config.out_dir,
-                        path_in_repo=f"model_assets/{config.model_name}",
-                        run_as_future=True,
-                    )
+                    if rid is not None:
+                        api.upload_folder(
+                            repo_id=rid,
+                            folder_path=dpath,
+                            path_in_repo=f"Data/{mname}",
+                            delete_patterns="*.pth",
+                            ignore_patterns=f"{dpath}/raw",
+                            run_as_future=True,
+                        )
+                        api.upload_folder(
+                            repo_id=rid,
+                            folder_path=odir,
+                            path_in_repo=f"model_assets/{mname}",
+                            run_as_future=True,
+                        )
+
+                _ckpt_save_pool.submit(_do_save)
 
         global_step += 1
         if pbar is not None:
