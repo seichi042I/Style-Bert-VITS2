@@ -1,4 +1,3 @@
-import gc
 import os
 import random
 import sys
@@ -598,12 +597,6 @@ class PreCollatedBatchStore:
         logger.info(
             f"Pre-collated {n_batches} batches ({total_mb:.0f} MB in CPU memory)"
         )
-
-        # Per-sample cache is no longer needed -- free it
-        if hasattr(dataset, "_cache") and dataset._cache is not None:
-            dataset._cache = None
-            gc.collect()
-            logger.info("Released per-sample RAM cache")
 
     # ------------------------------------------------------------------
     # Phase 2 -- call AFTER model / optimizer / DDP are on GPU

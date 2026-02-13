@@ -779,8 +779,8 @@ def create_train_app():
         with gr.Accordion("高速化オプション（GPUクラウド向け）", open=False):
             with gr.Row():
                 cache_in_memory = gr.Checkbox(
-                    label="学習データをRAMにプリロード",
-                    info="大容量RAMがある環境向け。全データをRAMに読み込み、学習中のディスクI/Oを排除します",
+                    label="学習データをプリロード（VRAM常駐 / pinned RAM自動判定）",
+                    info="全バッチを事前にcollateし、VRAMに収まればGPU常駐(転送ゼロ)、収まらなければpinned RAMで高速転送。GPU使用率が安定します",
                     value=False,
                 )
                 bf16_train = gr.Checkbox(
@@ -796,7 +796,7 @@ def create_train_app():
             with gr.Row():
                 num_workers_train = gr.Slider(
                     label="DataLoaderワーカー数",
-                    info="0で自動設定（RAMプリロード時: 8、通常時: CPU数の半分）。手動で指定する場合は1以上を設定",
+                    info="0で自動設定（CPU数の半分）。プリロード有効時はDataLoaderを使わないため無視されます",
                     value=0,
                     minimum=0,
                     maximum=cpu_count(),

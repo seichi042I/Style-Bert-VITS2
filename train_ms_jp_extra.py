@@ -284,9 +284,9 @@ def run():
         utils.check_git_hash(model_dir)
         writer = SummaryWriter(log_dir=model_dir)
         writer_eval = SummaryWriter(log_dir=os.path.join(model_dir, "eval"))
-    train_dataset = TextAudioSpeakerLoader(
-        hps.data.training_files, hps.data, cache_in_memory=args.cache_in_memory
-    )
+    # Per-sample RAM cache is unnecessary: PreCollatedBatchStore reads from
+    # disk directly into collated batches, avoiding a redundant copy.
+    train_dataset = TextAudioSpeakerLoader(hps.data.training_files, hps.data)
     collate_fn = TextAudioSpeakerCollate(use_jp_extra=True)
     if not args.not_use_custom_batch_sampler:
         train_sampler = DistributedBucketSampler(
