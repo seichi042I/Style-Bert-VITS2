@@ -1,3 +1,4 @@
+import gc
 import os
 import random
 import sys
@@ -550,3 +551,140 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
 
     def __len__(self):
         return self.num_samples // self.batch_size
+
+
+class PreCollatedBatchStore:
+    """
+    Pre-collate all batches at init and optionally transfer to VRAM.
+
+    Phase 1 (constructor):
+        Collate all batches from batch_sampler into CPU tensors.
+        Release the dataset's per-sample cache afterwards.
+    Phase 2 (transfer_to_device):
+        Measure free VRAM (after model/optimizer are loaded) and choose:
+          Strategy A -- Move all batches to VRAM.  Per-batch transfer cost = 0.
+          Strategy B -- Pin batches in CPU memory.  Per-batch transfer = fast async copy.
+
+    Drop-in replacement for DataLoader: supports iter(), len(), enumerate().
+    Batch composition is fixed at init; batch ORDER is shuffled each epoch.
+    """
+
+    def __init__(self, dataset, batch_sampler, collate_fn):
+        self.batch_sampler = batch_sampler
+        self._batches = []
+        self.on_gpu = False
+        self._total_bytes = 0
+
+        all_batch_indices = list(batch_sampler)
+        n_batches = len(all_batch_indices)
+        logger.info(f"Pre-collating {n_batches} batches...")
+
+        for batch_indices in tqdm(
+            all_batch_indices,
+            desc="Pre-collating batches",
+            file=sys.stdout,
+            dynamic_ncols=True,
+        ):
+            samples = [dataset[i] for i in batch_indices]
+            batch = collate_fn(samples)
+            self._total_bytes += sum(
+                t.nelement() * t.element_size()
+                for t in batch
+                if isinstance(t, torch.Tensor)
+            )
+            self._batches.append(batch)
+
+        total_mb = self._total_bytes / (1024 * 1024)
+        logger.info(
+            f"Pre-collated {n_batches} batches ({total_mb:.0f} MB in CPU memory)"
+        )
+
+        # Per-sample cache is no longer needed -- free it
+        if hasattr(dataset, "_cache") and dataset._cache is not None:
+            dataset._cache = None
+            gc.collect()
+            logger.info("Released per-sample RAM cache")
+
+    # ------------------------------------------------------------------
+    # Phase 2 -- call AFTER model / optimizer / DDP are on GPU
+    # ------------------------------------------------------------------
+    def transfer_to_device(self, local_rank, max_vram_usage_ratio=0.7):
+        """
+        Check free VRAM and move batches to GPU (Strategy A) or pin in
+        CPU memory (Strategy B).
+
+        max_vram_usage_ratio: fraction of *currently free* VRAM that may
+            be used for data.  The remainder is reserved for activations
+            and transient allocations during forward/backward.
+        """
+        free_vram, _ = torch.cuda.mem_get_info(local_rank)
+        free_mb = free_vram / (1024 * 1024)
+        data_mb = self._total_bytes / (1024 * 1024)
+        budget_mb = free_mb * max_vram_usage_ratio
+
+        if data_mb <= budget_mb:
+            device = f"cuda:{local_rank}"
+            logger.info(
+                f"Strategy A (VRAM resident): {len(self._batches)} batches "
+                f"({data_mb:.0f} MB) -> VRAM "
+                f"(free: {free_mb:.0f} MB, budget: {budget_mb:.0f} MB)"
+            )
+            gpu_batches = []
+            for batch in tqdm(
+                self._batches,
+                desc="-> VRAM",
+                file=sys.stdout,
+                dynamic_ncols=True,
+            ):
+                gpu_batches.append(
+                    tuple(
+                        t.to(device, non_blocking=True)
+                        if isinstance(t, torch.Tensor)
+                        else t
+                        for t in batch
+                    )
+                )
+            torch.cuda.synchronize(local_rank)
+            self._batches = gpu_batches
+            self.on_gpu = True
+            logger.info("All batches are now VRAM-resident")
+        else:
+            logger.info(
+                f"Strategy B (pinned RAM): {len(self._batches)} batches "
+                f"({data_mb:.0f} MB) -> pinned RAM "
+                f"(VRAM free: {free_mb:.0f} MB, budget: {budget_mb:.0f} MB)"
+            )
+            pinned = []
+            for batch in tqdm(
+                self._batches,
+                desc="-> pinned RAM",
+                file=sys.stdout,
+                dynamic_ncols=True,
+            ):
+                pinned.append(
+                    tuple(
+                        t.pin_memory()
+                        if isinstance(t, torch.Tensor)
+                        else t
+                        for t in batch
+                    )
+                )
+            self._batches = pinned
+            self.on_gpu = False
+            logger.info("All batches are now in pinned RAM")
+
+    # ------------------------------------------------------------------
+    def shuffle(self, generator=None):
+        """Shuffle batch order (call once per epoch)."""
+        n = len(self._batches)
+        if generator is not None:
+            perm = torch.randperm(n, generator=generator).tolist()
+        else:
+            perm = torch.randperm(n).tolist()
+        self._batches = [self._batches[i] for i in perm]
+
+    def __iter__(self):
+        return iter(self._batches)
+
+    def __len__(self):
+        return len(self._batches)

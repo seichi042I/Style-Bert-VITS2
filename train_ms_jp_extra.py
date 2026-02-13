@@ -23,6 +23,7 @@ import default_style
 from config import get_config
 from data_utils import (
     DistributedBucketSampler,
+    PreCollatedBatchStore,
     TextAudioSpeakerCollate,
     TextAudioSpeakerLoader,
 )
@@ -190,16 +191,18 @@ def run():
         hps.train.bf16_run = True
 
     # Determine optimal num_workers for DataLoader
-    if args.num_workers is not None:
+    if args.cache_in_memory:
+        # PreCollatedBatchStore bypasses DataLoader workers entirely
+        num_workers = 0
+        prefetch_factor = None
+    elif args.num_workers is not None:
         num_workers = args.num_workers
-    elif args.cache_in_memory:
-        # Data is in RAM; workers handle collation in parallel with GPU compute
-        num_workers = min(8, os.cpu_count() or 1)
+        prefetch_factor = 8 if num_workers > 0 else None
     else:
         num_workers = min(
             config.train_ms_config.num_workers, (os.cpu_count() or 1) // 2
         )
-    prefetch_factor = 8 if num_workers > 0 else None
+        prefetch_factor = 8 if num_workers > 0 else None
 
     logger.info(
         f"Training config: batch_size={hps.train.batch_size}, "
@@ -294,16 +297,21 @@ def run():
             rank=rank,
             shuffle=True,
         )
-        train_loader = DataLoader(
-            train_dataset,
-            num_workers=num_workers,
-            shuffle=False,
-            pin_memory=True,
-            collate_fn=collate_fn,
-            batch_sampler=train_sampler,
-            persistent_workers=num_workers > 0,
-            prefetch_factor=prefetch_factor,
-        )
+        if args.cache_in_memory:
+            train_loader = PreCollatedBatchStore(
+                train_dataset, train_sampler, collate_fn,
+            )
+        else:
+            train_loader = DataLoader(
+                train_dataset,
+                num_workers=num_workers,
+                shuffle=False,
+                pin_memory=True,
+                collate_fn=collate_fn,
+                batch_sampler=train_sampler,
+                persistent_workers=num_workers > 0,
+                prefetch_factor=prefetch_factor,
+            )
     else:
         train_sampler = DistributedLengthGroupedSampler(
             dataset=train_dataset,
@@ -313,16 +321,26 @@ def run():
             lengths=train_dataset.lengths,
             drop_last=True,
         )
-        train_loader = DataLoader(
-            train_dataset,
-            num_workers=num_workers,
-            pin_memory=True,
-            collate_fn=collate_fn,
-            sampler=train_sampler,
-            batch_size=hps.train.batch_size,
-            persistent_workers=num_workers > 0,
-            prefetch_factor=prefetch_factor,
-        )
+        if args.cache_in_memory:
+            from torch.utils.data import BatchSampler
+
+            batch_sampler = BatchSampler(
+                train_sampler, batch_size=hps.train.batch_size, drop_last=True,
+            )
+            train_loader = PreCollatedBatchStore(
+                train_dataset, batch_sampler, collate_fn,
+            )
+        else:
+            train_loader = DataLoader(
+                train_dataset,
+                num_workers=num_workers,
+                pin_memory=True,
+                collate_fn=collate_fn,
+                sampler=train_sampler,
+                batch_size=hps.train.batch_size,
+                persistent_workers=num_workers > 0,
+                prefetch_factor=prefetch_factor,
+            )
         logger.info("Using DistributedLengthGroupedSampler for training.")
         logger.debug(f"len(train_dataset): {len(train_dataset)}")
         logger.debug(f"len(train_loader): {len(train_loader)}")
@@ -633,6 +651,12 @@ def run():
         scheduler_wd = None
         wl = None
     scaler = GradScaler(enabled=hps.train.bf16_run)
+
+    # Move pre-collated batches to VRAM (Strategy A) or pin in RAM (Strategy B)
+    # after model/optimizer/DDP are on GPU so VRAM measurement is accurate
+    if isinstance(train_loader, PreCollatedBatchStore):
+        train_loader.transfer_to_device(local_rank)
+
     logger.info("Start training.")
 
     diff = abs(
@@ -780,6 +804,11 @@ def train_and_evaluate(
     if writers is not None:
         writer, writer_eval = writers
 
+    # Shuffle batch order each epoch for pre-collated store
+    if isinstance(train_loader, PreCollatedBatchStore):
+        g = torch.Generator()
+        g.manual_seed(epoch)
+        train_loader.shuffle(generator=g)
     # train_loader.batch_sampler.set_epoch(epoch)
     global global_step
 
