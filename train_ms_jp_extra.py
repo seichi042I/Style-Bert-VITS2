@@ -22,6 +22,7 @@ from transformers.trainer_pt_utils import DistributedLengthGroupedSampler
 import default_style
 from config import get_config
 from data_utils import (
+    CUDAPrefetcher,
     DistributedBucketSampler,
     PreCollatedBatchStore,
     TextAudioSpeakerCollate,
@@ -284,15 +285,14 @@ def run():
         utils.check_git_hash(model_dir)
         writer = SummaryWriter(log_dir=model_dir)
         writer_eval = SummaryWriter(log_dir=os.path.join(model_dir, "eval"))
-    # Per-sample RAM cache is unnecessary: PreCollatedBatchStore reads from
-    # disk directly into collated batches, avoiding a redundant copy.
     train_dataset = TextAudioSpeakerLoader(hps.data.training_files, hps.data)
-    # pin_memory=True: collate allocates directly in pinned memory,
-    # eliminating the post-hoc pin_memory() copy.
-    # pin_memory=False: regular allocation; DataLoader handles pinning.
-    collate_fn = TextAudioSpeakerCollate(
-        use_jp_extra=True, pin_memory=args.cache_in_memory,
-    )
+    # Collate always produces pageable tensors.  Pinning responsibility:
+    #   - DataLoader path: DataLoader(pin_memory=True) pins via its internal
+    #     thread, only prefetch_factor batches at a time.
+    #   - PreCollatedBatchStore path: batches stay pageable; bulk-pinning all
+    #     training data would waste physical RAM (page-locked memory cannot be
+    #     swapped by the OS).
+    collate_fn = TextAudioSpeakerCollate(use_jp_extra=True)
     if not args.not_use_custom_batch_sampler:
         train_sampler = DistributedBucketSampler(
             train_dataset,
@@ -657,10 +657,17 @@ def run():
         wl = None
     scaler = GradScaler(enabled=hps.train.bf16_run)
 
-    # Move pre-collated batches to VRAM (Strategy A) or pin in RAM (Strategy B)
-    # after model/optimizer/DDP are on GPU so VRAM measurement is accurate
+    # Move pre-collated batches to VRAM (Strategy A) or set up VRAM prefetch
+    # (Strategy B) after model/optimizer/DDP are on GPU so VRAM measurement
+    # is accurate.  For the standard DataLoader path, wrap with
+    # CUDAPrefetcher so that H2D transfers overlap with GPU compute via a
+    # background thread + dedicated CUDA stream.
     if isinstance(train_loader, PreCollatedBatchStore):
         train_loader.transfer_to_device(local_rank)
+    else:
+        train_loader = CUDAPrefetcher(
+            train_loader, f"cuda:{local_rank}", max_prefetch=2
+        )
 
     logger.info("Start training.")
 

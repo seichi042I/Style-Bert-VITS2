@@ -1,7 +1,9 @@
 import os
 import random
 import sys
+import threading
 from collections import defaultdict
+from queue import Queue
 
 import numpy as np
 import torch
@@ -272,10 +274,9 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
 class TextAudioSpeakerCollate:
     """Zero-pads model inputs and targets"""
 
-    def __init__(self, return_ids=False, use_jp_extra=False, pin_memory=False):
+    def __init__(self, return_ids=False, use_jp_extra=False):
         self.return_ids = return_ids
         self.use_jp_extra = use_jp_extra
-        self.pin_memory = pin_memory
 
     def __call__(self, batch):
         """Collate's training batch from normalized text, audio and speaker identities
@@ -292,26 +293,29 @@ class TextAudioSpeakerCollate:
         max_spec_len = max([x[1].size(1) for x in batch])
         max_wav_len = max([x[2].size(1) for x in batch])
 
-        _pin = self.pin_memory
-
         # Lengths / IDs — fully assigned in the loop, no need to zero
-        text_lengths = torch.empty(len(batch), dtype=torch.long, pin_memory=_pin)
-        spec_lengths = torch.empty(len(batch), dtype=torch.long, pin_memory=_pin)
-        wav_lengths = torch.empty(len(batch), dtype=torch.long, pin_memory=_pin)
-        sid = torch.empty(len(batch), dtype=torch.long, pin_memory=_pin)
+        text_lengths = torch.empty(len(batch), dtype=torch.long)
+        spec_lengths = torch.empty(len(batch), dtype=torch.long)
+        wav_lengths = torch.empty(len(batch), dtype=torch.long)
+        sid = torch.empty(len(batch), dtype=torch.long)
 
         # Padded sequences — zero-initialized
-        text_padded = torch.zeros(len(batch), max_text_len, dtype=torch.long, pin_memory=_pin)
-        tone_padded = torch.zeros(len(batch), max_text_len, dtype=torch.long, pin_memory=_pin)
-        language_padded = torch.zeros(len(batch), max_text_len, dtype=torch.long, pin_memory=_pin)
-        bert_padded = torch.zeros(len(batch), 1024, max_text_len, pin_memory=_pin)
+        # NOTE: pin_memory is intentionally NOT used here.
+        # For DataLoader path, DataLoader(pin_memory=True) handles pinning
+        # via its internal thread (only prefetch_factor batches pinned at a time).
+        # For PreCollatedBatchStore, pageable memory is correct — bulk-pinning
+        # all batches wastes physical RAM (page-locked memory cannot be swapped).
+        text_padded = torch.zeros(len(batch), max_text_len, dtype=torch.long)
+        tone_padded = torch.zeros(len(batch), max_text_len, dtype=torch.long)
+        language_padded = torch.zeros(len(batch), max_text_len, dtype=torch.long)
+        bert_padded = torch.zeros(len(batch), 1024, max_text_len)
         if not self.use_jp_extra:
-            ja_bert_padded = torch.zeros(len(batch), 1024, max_text_len, pin_memory=_pin)
-            en_bert_padded = torch.zeros(len(batch), 1024, max_text_len, pin_memory=_pin)
-        style_vec = torch.zeros(len(batch), 256, pin_memory=_pin)
+            ja_bert_padded = torch.zeros(len(batch), 1024, max_text_len)
+            en_bert_padded = torch.zeros(len(batch), 1024, max_text_len)
+        style_vec = torch.zeros(len(batch), 256)
 
-        spec_padded = torch.zeros(len(batch), batch[0][1].size(0), max_spec_len, pin_memory=_pin)
-        wav_padded = torch.zeros(len(batch), 1, max_wav_len, pin_memory=_pin)
+        spec_padded = torch.zeros(len(batch), batch[0][1].size(0), max_spec_len)
+        wav_padded = torch.zeros(len(batch), 1, max_wav_len)
 
         for i in range(len(ids_sorted_decreasing)):
             row = batch[ids_sorted_decreasing[i]]
@@ -546,17 +550,123 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
         return self.num_samples // self.batch_size
 
 
+_PREFETCH_SENTINEL = object()
+
+
+class _VRAMPrefetchIter:
+    """Background-thread iterator: pin (if needed) + async DMA to VRAM.
+
+    A dedicated background thread takes CPU batches from *source_iter*,
+    pins any pageable tensors (skips already-pinned ones), and launches
+    an asynchronous H2D copy on a **non-default CUDA stream**.  The result
+    is queued for the training loop.
+
+    This achieves true copy-compute overlap because:
+      1. Source is pinned  →  cudaMemcpyAsync returns immediately.
+      2. Transfer is on a separate stream  →  DMA engine and CUDA cores
+         work in parallel.
+      3. Modern GPUs (Volta+) have ≥ 2 DMA engines.
+
+    The queue depth (*max_prefetch*) controls how many batches reside on
+    VRAM ahead of consumption.  2 is enough for double-buffering; more
+    just wastes VRAM without improving throughput.
+    """
+
+    def __init__(self, source_iter, device, max_prefetch=2):
+        self._device = device
+        self._stream = torch.cuda.Stream(device=device)
+        self._queue: Queue = Queue(maxsize=max_prefetch)
+        self._thread = threading.Thread(
+            target=self._worker, args=(source_iter,), daemon=True
+        )
+        self._thread.start()
+
+    # --- producer (background thread) -----------------------------------
+    def _worker(self, source_iter):
+        try:
+            for batch in source_iter:
+                # Pin only pageable tensors; already-pinned ones (from
+                # DataLoader pin_memory=True) are left as-is.
+                pinned = tuple(
+                    t.pin_memory()
+                    if isinstance(t, torch.Tensor) and not t.is_pinned()
+                    else t
+                    for t in batch
+                )
+                # Async DMA on the dedicated transfer stream.
+                with torch.cuda.stream(self._stream):
+                    on_device = tuple(
+                        t.to(self._device, non_blocking=True)
+                        if isinstance(t, torch.Tensor)
+                        else t
+                        for t in pinned
+                    )
+                event = self._stream.record_event()
+                # Queue.put blocks when full → natural back-pressure.
+                # Keep *pinned* alive until the consumer waits on *event*;
+                # freeing pinned memory while the DMA reads it is UB.
+                self._queue.put((on_device, event, pinned))
+        except Exception as exc:
+            self._queue.put(exc)
+        self._queue.put(_PREFETCH_SENTINEL)
+
+    # --- consumer (main / training thread) ------------------------------
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self._queue.get()
+        if item is _PREFETCH_SENTINEL:
+            raise StopIteration
+        if isinstance(item, Exception):
+            raise item
+        on_device, event, _pinned = item
+        # Block the default (compute) stream until this batch's DMA is done.
+        torch.cuda.current_stream(self._device).wait_event(event)
+        # _pinned goes out of scope here; safe because wait_event guarantees
+        # the DMA has completed on the compute stream's timeline.
+        return on_device
+
+
+class CUDAPrefetcher:
+    """Wrap any CPU-batch loader with a VRAM prefetch queue.
+
+    Returns CUDA tensors directly to the training loop.  Existing
+    ``.cuda(non_blocking=True)`` calls in the loop become no-ops
+    (tensor is already on the target device).
+
+    Works transparently with DataLoader (pin_memory=True or False)
+    and PreCollatedBatchStore alike.
+    """
+
+    def __init__(self, loader, device, max_prefetch=2):
+        self._loader = loader
+        self._device = device
+        self._max_prefetch = max_prefetch
+
+    def __iter__(self):
+        return _VRAMPrefetchIter(
+            iter(self._loader), self._device, self._max_prefetch
+        )
+
+    def __len__(self):
+        return len(self._loader)
+
+
 class PreCollatedBatchStore:
     """
-    Pre-collate all batches in a single pass.  No duplicate copies.
+    Pre-collate all batches in a single pass and store in pageable memory.
 
-    The collate_fn is expected to allocate tensors directly in pinned
-    memory (via pin_memory=True on TextAudioSpeakerCollate).  This class
-    just calls collate and stores the result — no post-hoc pin_memory().
+    All batches are stored as regular (pageable) CPU tensors.  Pinned memory
+    is NOT used for bulk storage — page-locked memory cannot be swapped by
+    the OS, so pinning all training data wastes physical RAM and can cause
+    system-wide memory pressure.
 
     transfer_to_device (call AFTER model/optimizer/DDP are on GPU):
-        Strategy A -- VRAM fits: move pinned -> VRAM in-place.
-        Strategy B -- VRAM insufficient: no-op, already pinned.
+        Strategy A -- VRAM fits: move pageable -> VRAM in-place.
+        Strategy B -- VRAM insufficient: keep in pageable RAM, use
+                      _VRAMPrefetchIter for copy-compute overlap
+                      (BG thread: pin → async DMA on a separate stream).
 
     Drop-in replacement for DataLoader: supports iter(), len(), enumerate().
     Batch composition is fixed at init; batch ORDER is shuffled each epoch.
@@ -567,6 +677,8 @@ class PreCollatedBatchStore:
         self._batches = []
         self.on_gpu = False
         self._total_bytes = 0
+        self._prefetch_device = None
+        self._max_prefetch = 2
 
         all_batch_indices = list(batch_sampler)
         n_batches = len(all_batch_indices)
@@ -597,8 +709,9 @@ class PreCollatedBatchStore:
     # ------------------------------------------------------------------
     def transfer_to_device(self, local_rank, max_vram_usage_ratio=0.7):
         """
-        Strategy A: if data fits in VRAM, move pinned -> VRAM in-place.
-        Strategy B: already pinned, nothing to do.
+        Strategy A: data fits in VRAM → move pageable → VRAM in-place.
+        Strategy B: VRAM insufficient → keep pageable, prefetch via
+                    _VRAMPrefetchIter (BG thread pin + async DMA).
         """
         free_vram, _ = torch.cuda.mem_get_info(local_rank)
         free_mb = free_vram / (1024 * 1024)
@@ -609,7 +722,7 @@ class PreCollatedBatchStore:
             device = f"cuda:{local_rank}"
             logger.info(
                 f"Strategy A (VRAM resident): {len(self._batches)} batches "
-                f"({data_mb:.0f} MB) -> VRAM "
+                f"({data_mb:.0f} MB) pageable -> VRAM "
                 f"(free: {free_mb:.0f} MB, budget: {budget_mb:.0f} MB)"
             )
             # In-place replacement: each pinned batch is freed as soon as
@@ -631,11 +744,23 @@ class PreCollatedBatchStore:
             self.on_gpu = True
             logger.info("All batches are now VRAM-resident")
         else:
-            # Already pinned from __init__ -- nothing to do.
             self.on_gpu = False
+            self._prefetch_device = f"cuda:{local_rank}"
+            # Determine prefetch depth: how many batches to queue on VRAM.
+            # Use ~15% of free VRAM for the prefetch buffer, leaving the
+            # rest for activations, gradients, and optimizer states.
+            avg_batch_mb = data_mb / max(len(self._batches), 1)
+            prefetch_vram_mb = free_mb * 0.15
+            if avg_batch_mb > 0:
+                self._max_prefetch = max(
+                    2, min(int(prefetch_vram_mb / avg_batch_mb), len(self._batches))
+                )
+            else:
+                self._max_prefetch = 2
             logger.info(
-                f"Strategy B (pinned RAM): {len(self._batches)} batches "
-                f"({data_mb:.0f} MB) already pinned "
+                f"Strategy B (pageable + VRAM prefetch): "
+                f"{len(self._batches)} batches ({data_mb:.0f} MB) in pageable RAM, "
+                f"prefetch depth={self._max_prefetch} "
                 f"(VRAM free: {free_mb:.0f} MB, budget: {budget_mb:.0f} MB)"
             )
 
@@ -650,6 +775,15 @@ class PreCollatedBatchStore:
         self._batches = [self._batches[i] for i in perm]
 
     def __iter__(self):
+        if self.on_gpu:
+            return iter(self._batches)
+        if self._prefetch_device is not None:
+            return _VRAMPrefetchIter(
+                iter(self._batches),
+                self._prefetch_device,
+                self._max_prefetch,
+            )
+        # Fallback: transfer_to_device was not called.
         return iter(self._batches)
 
     def __len__(self):
