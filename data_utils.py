@@ -272,9 +272,10 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
 class TextAudioSpeakerCollate:
     """Zero-pads model inputs and targets"""
 
-    def __init__(self, return_ids=False, use_jp_extra=False):
+    def __init__(self, return_ids=False, use_jp_extra=False, pin_memory=False):
         self.return_ids = return_ids
         self.use_jp_extra = use_jp_extra
+        self.pin_memory = pin_memory
 
     def __call__(self, batch):
         """Collate's training batch from normalized text, audio and speaker identities
@@ -291,33 +292,26 @@ class TextAudioSpeakerCollate:
         max_spec_len = max([x[1].size(1) for x in batch])
         max_wav_len = max([x[2].size(1) for x in batch])
 
-        text_lengths = torch.LongTensor(len(batch))
-        spec_lengths = torch.LongTensor(len(batch))
-        wav_lengths = torch.LongTensor(len(batch))
-        sid = torch.LongTensor(len(batch))
+        _pin = self.pin_memory
 
-        text_padded = torch.LongTensor(len(batch), max_text_len)
-        tone_padded = torch.LongTensor(len(batch), max_text_len)
-        language_padded = torch.LongTensor(len(batch), max_text_len)
-        # This is ZH bert if not use_jp_extra, JA bert if use_jp_extra
-        bert_padded = torch.FloatTensor(len(batch), 1024, max_text_len)
-        if not self.use_jp_extra:
-            ja_bert_padded = torch.FloatTensor(len(batch), 1024, max_text_len)
-            en_bert_padded = torch.FloatTensor(len(batch), 1024, max_text_len)
-        style_vec = torch.FloatTensor(len(batch), 256)
+        # Lengths / IDs — fully assigned in the loop, no need to zero
+        text_lengths = torch.empty(len(batch), dtype=torch.long, pin_memory=_pin)
+        spec_lengths = torch.empty(len(batch), dtype=torch.long, pin_memory=_pin)
+        wav_lengths = torch.empty(len(batch), dtype=torch.long, pin_memory=_pin)
+        sid = torch.empty(len(batch), dtype=torch.long, pin_memory=_pin)
 
-        spec_padded = torch.FloatTensor(len(batch), batch[0][1].size(0), max_spec_len)
-        wav_padded = torch.FloatTensor(len(batch), 1, max_wav_len)
-        text_padded.zero_()
-        tone_padded.zero_()
-        language_padded.zero_()
-        spec_padded.zero_()
-        wav_padded.zero_()
-        bert_padded.zero_()
+        # Padded sequences — zero-initialized
+        text_padded = torch.zeros(len(batch), max_text_len, dtype=torch.long, pin_memory=_pin)
+        tone_padded = torch.zeros(len(batch), max_text_len, dtype=torch.long, pin_memory=_pin)
+        language_padded = torch.zeros(len(batch), max_text_len, dtype=torch.long, pin_memory=_pin)
+        bert_padded = torch.zeros(len(batch), 1024, max_text_len, pin_memory=_pin)
         if not self.use_jp_extra:
-            ja_bert_padded.zero_()
-            en_bert_padded.zero_()
-        style_vec.zero_()
+            ja_bert_padded = torch.zeros(len(batch), 1024, max_text_len, pin_memory=_pin)
+            en_bert_padded = torch.zeros(len(batch), 1024, max_text_len, pin_memory=_pin)
+        style_vec = torch.zeros(len(batch), 256, pin_memory=_pin)
+
+        spec_padded = torch.zeros(len(batch), batch[0][1].size(0), max_spec_len, pin_memory=_pin)
+        wav_padded = torch.zeros(len(batch), 1, max_wav_len, pin_memory=_pin)
 
         for i in range(len(ids_sorted_decreasing)):
             row = batch[ids_sorted_decreasing[i]]
@@ -554,16 +548,14 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
 
 class PreCollatedBatchStore:
     """
-    Pre-collate all batches and pin in a single pass.
+    Pre-collate all batches in a single pass.  No duplicate copies.
 
-    Constructor:
-        disk -> collate -> pin_memory per batch.
-        Each batch is pinned immediately after collation so that the
-        unpinned copy goes out of scope at once.  Peak overhead = 1 batch.
+    The collate_fn is expected to allocate tensors directly in pinned
+    memory (via pin_memory=True on TextAudioSpeakerCollate).  This class
+    just calls collate and stores the result — no post-hoc pin_memory().
 
     transfer_to_device (call AFTER model/optimizer/DDP are on GPU):
-        Strategy A -- VRAM fits: move pinned -> VRAM in-place (batch by
-                      batch, freeing pinned memory as we go).
+        Strategy A -- VRAM fits: move pinned -> VRAM in-place.
         Strategy B -- VRAM insufficient: no-op, already pinned.
 
     Drop-in replacement for DataLoader: supports iter(), len(), enumerate().
@@ -578,7 +570,7 @@ class PreCollatedBatchStore:
 
         all_batch_indices = list(batch_sampler)
         n_batches = len(all_batch_indices)
-        logger.info(f"Pre-collating {n_batches} batches into pinned RAM...")
+        logger.info(f"Pre-collating {n_batches} batches...")
 
         for batch_indices in tqdm(
             all_batch_indices,
@@ -588,22 +580,16 @@ class PreCollatedBatchStore:
         ):
             samples = [dataset[i] for i in batch_indices]
             batch = collate_fn(samples)
-            # Pin immediately -- the unpinned `batch` tuple is discarded
-            # at the end of this iteration, so we never hold two full copies.
-            pinned_batch = tuple(
-                t.pin_memory() if isinstance(t, torch.Tensor) else t
-                for t in batch
-            )
             self._total_bytes += sum(
                 t.nelement() * t.element_size()
-                for t in pinned_batch
+                for t in batch
                 if isinstance(t, torch.Tensor)
             )
-            self._batches.append(pinned_batch)
+            self._batches.append(batch)
 
         total_mb = self._total_bytes / (1024 * 1024)
         logger.info(
-            f"Pre-collated {n_batches} batches ({total_mb:.0f} MB in pinned RAM)"
+            f"Pre-collated {n_batches} batches ({total_mb:.0f} MB)"
         )
 
     # ------------------------------------------------------------------
