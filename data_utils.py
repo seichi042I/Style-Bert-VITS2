@@ -271,6 +271,11 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         return len(self.audiopaths_sid_text)
 
 
+def _round_up(x: int, granularity: int) -> int:
+    """Round *x* up to the nearest multiple of *granularity*."""
+    return (x + granularity - 1) // granularity * granularity
+
+
 class TextAudioSpeakerCollate:
     """Zero-pads model inputs and targets"""
 
@@ -289,9 +294,20 @@ class TextAudioSpeakerCollate:
             torch.LongTensor([x[1].size(1) for x in batch]), dim=0, descending=True
         )
 
-        max_text_len = max([len(x[0]) for x in batch])
-        max_spec_len = max([x[1].size(1) for x in batch])
-        max_wav_len = max([x[2].size(1) for x in batch])
+        # Round up to fixed granularity so that tensor shapes are reused
+        # across batches.  This stabilizes VRAM usage in three ways:
+        #   1. The CUDA caching allocator can reuse memory blocks more often
+        #      (same-sized allocations hit the free-list instead of splitting).
+        #   2. CuDNN benchmark mode caches fewer algorithm configurations
+        #      (fewer unique shapes → fewer workspace allocations).
+        #   3. Intermediate activations keep a consistent footprint.
+        _PAD_TEXT = 32
+        _PAD_SPEC = 32
+        _PAD_WAV = 512
+
+        max_text_len = _round_up(max(len(x[0]) for x in batch), _PAD_TEXT)
+        max_spec_len = _round_up(max(x[1].size(1) for x in batch), _PAD_SPEC)
+        max_wav_len = _round_up(max(x[2].size(1) for x in batch), _PAD_WAV)
 
         # Lengths / IDs — fully assigned in the loop, no need to zero
         text_lengths = torch.empty(len(batch), dtype=torch.long)
