@@ -554,15 +554,17 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
 
 class PreCollatedBatchStore:
     """
-    Pre-collate all batches at init and optionally transfer to VRAM.
+    Pre-collate all batches and pin in a single pass.
 
-    Phase 1 (constructor):
-        Collate all batches from batch_sampler into CPU tensors.
-        Release the dataset's per-sample cache afterwards.
-    Phase 2 (transfer_to_device):
-        Measure free VRAM (after model/optimizer are loaded) and choose:
-          Strategy A -- Move all batches to VRAM.  Per-batch transfer cost = 0.
-          Strategy B -- Pin batches in CPU memory.  Per-batch transfer = fast async copy.
+    Constructor:
+        disk -> collate -> pin_memory per batch.
+        Each batch is pinned immediately after collation so that the
+        unpinned copy goes out of scope at once.  Peak overhead = 1 batch.
+
+    transfer_to_device (call AFTER model/optimizer/DDP are on GPU):
+        Strategy A -- VRAM fits: move pinned -> VRAM in-place (batch by
+                      batch, freeing pinned memory as we go).
+        Strategy B -- VRAM insufficient: no-op, already pinned.
 
     Drop-in replacement for DataLoader: supports iter(), len(), enumerate().
     Batch composition is fixed at init; batch ORDER is shuffled each epoch.
@@ -576,7 +578,7 @@ class PreCollatedBatchStore:
 
         all_batch_indices = list(batch_sampler)
         n_batches = len(all_batch_indices)
-        logger.info(f"Pre-collating {n_batches} batches...")
+        logger.info(f"Pre-collating {n_batches} batches into pinned RAM...")
 
         for batch_indices in tqdm(
             all_batch_indices,
@@ -586,29 +588,31 @@ class PreCollatedBatchStore:
         ):
             samples = [dataset[i] for i in batch_indices]
             batch = collate_fn(samples)
+            # Pin immediately -- the unpinned `batch` tuple is discarded
+            # at the end of this iteration, so we never hold two full copies.
+            pinned_batch = tuple(
+                t.pin_memory() if isinstance(t, torch.Tensor) else t
+                for t in batch
+            )
             self._total_bytes += sum(
                 t.nelement() * t.element_size()
-                for t in batch
+                for t in pinned_batch
                 if isinstance(t, torch.Tensor)
             )
-            self._batches.append(batch)
+            self._batches.append(pinned_batch)
 
         total_mb = self._total_bytes / (1024 * 1024)
         logger.info(
-            f"Pre-collated {n_batches} batches ({total_mb:.0f} MB in CPU memory)"
+            f"Pre-collated {n_batches} batches ({total_mb:.0f} MB in pinned RAM)"
         )
 
     # ------------------------------------------------------------------
-    # Phase 2 -- call AFTER model / optimizer / DDP are on GPU
+    # Call AFTER model / optimizer / DDP are on GPU
     # ------------------------------------------------------------------
     def transfer_to_device(self, local_rank, max_vram_usage_ratio=0.7):
         """
-        Check free VRAM and move batches to GPU (Strategy A) or pin in
-        CPU memory (Strategy B).
-
-        max_vram_usage_ratio: fraction of *currently free* VRAM that may
-            be used for data.  The remainder is reserved for activations
-            and transient allocations during forward/backward.
+        Strategy A: if data fits in VRAM, move pinned -> VRAM in-place.
+        Strategy B: already pinned, nothing to do.
         """
         free_vram, _ = torch.cuda.mem_get_info(local_rank)
         free_mb = free_vram / (1024 * 1024)
@@ -622,49 +626,32 @@ class PreCollatedBatchStore:
                 f"({data_mb:.0f} MB) -> VRAM "
                 f"(free: {free_mb:.0f} MB, budget: {budget_mb:.0f} MB)"
             )
-            gpu_batches = []
-            for batch in tqdm(
-                self._batches,
+            # In-place replacement: each pinned batch is freed as soon as
+            # its VRAM copy is stored, so RAM shrinks as VRAM grows.
+            for i in tqdm(
+                range(len(self._batches)),
                 desc="-> VRAM",
                 file=sys.stdout,
                 dynamic_ncols=True,
             ):
-                gpu_batches.append(
-                    tuple(
-                        t.to(device, non_blocking=True)
-                        if isinstance(t, torch.Tensor)
-                        else t
-                        for t in batch
-                    )
+                batch = self._batches[i]
+                self._batches[i] = tuple(
+                    t.to(device, non_blocking=True)
+                    if isinstance(t, torch.Tensor)
+                    else t
+                    for t in batch
                 )
             torch.cuda.synchronize(local_rank)
-            self._batches = gpu_batches
             self.on_gpu = True
             logger.info("All batches are now VRAM-resident")
         else:
+            # Already pinned from __init__ -- nothing to do.
+            self.on_gpu = False
             logger.info(
                 f"Strategy B (pinned RAM): {len(self._batches)} batches "
-                f"({data_mb:.0f} MB) -> pinned RAM "
+                f"({data_mb:.0f} MB) already pinned "
                 f"(VRAM free: {free_mb:.0f} MB, budget: {budget_mb:.0f} MB)"
             )
-            pinned = []
-            for batch in tqdm(
-                self._batches,
-                desc="-> pinned RAM",
-                file=sys.stdout,
-                dynamic_ncols=True,
-            ):
-                pinned.append(
-                    tuple(
-                        t.pin_memory()
-                        if isinstance(t, torch.Tensor)
-                        else t
-                        for t in batch
-                    )
-                )
-            self._batches = pinned
-            self.on_gpu = False
-            logger.info("All batches are now in pinned RAM")
 
     # ------------------------------------------------------------------
     def shuffle(self, generator=None):
