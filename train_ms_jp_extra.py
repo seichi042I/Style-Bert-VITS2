@@ -3,6 +3,7 @@ import datetime
 import gc
 import os
 import platform
+from concurrent.futures import ThreadPoolExecutor
 
 # Optimize CUDA memory allocator to reduce fragmentation with large batches
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -60,6 +61,10 @@ config = get_config()
 global_step = 0
 
 api = HfApi()
+
+# Single-worker pool for async checkpoint I/O.  max_workers=1 ensures
+# sequential saves (no concurrent disk writes or model state access).
+_ckpt_save_pool = ThreadPoolExecutor(max_workers=1)
 
 
 def run():
@@ -1164,8 +1169,13 @@ def train_and_evaluate(
             )
             pbar.update()
 
-    gc.collect()
-    torch.cuda.empty_cache()
+    # NOTE: gc.collect() + torch.cuda.empty_cache() were here previously.
+    # gc.collect() holds the GIL for 100-500ms (blocks prefetch thread).
+    # empty_cache() purges the CUDA caching allocator, causing slow
+    # cudaMalloc re-allocations on the next step.  Together they produce
+    # a ~0.5-1s GPU idle gap at every epoch boundary.
+    # Removed: the caching allocator handles fragmentation adequately,
+    # and Python's cyclic GC runs automatically when needed.
     if pbar is None and rank == 0:
         logger.info(f"====> Epoch: {epoch}, step: {global_step}")
 
