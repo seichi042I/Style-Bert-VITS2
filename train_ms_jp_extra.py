@@ -680,7 +680,7 @@ def run():
         # NOTE: torch is already imported globally; do NOT use
         # ``import torch._logging`` here — it would shadow the global
         # ``torch`` binding for the entire function scope (Python scoping).
-        torch._logging.set_logs(recompiles=2, graph_breaks=True)
+        torch._logging.set_logs(recompiles=True, graph_breaks=True)
 
         # Automatically fall back to eager execution if Triton/inductor
         # compilation fails at runtime (e.g. PassManager::run failures).
