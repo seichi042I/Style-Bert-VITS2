@@ -33,17 +33,18 @@ import torch
 # PyTorch 2.6+ で torch.load のデフォルトが weights_only=True に変更された。
 # pyannote-audio 3.x のチェックポイントには TorchVersion, Specifications 等
 # weights_only=True では許可されないオブジェクトが多数含まれる。
-# HuggingFace の信頼できるモデル読み込みのため torch.load をパッチする。
+# lightning_fabric が torch.serialization.load を直接参照する場合があるため両方パッチする。
 _orig_torch_load = torch.load
 
 
 def _patched_torch_load(*args, **kwargs):
     kwargs = dict(kwargs)
-    kwargs.setdefault("weights_only", False)
+    kwargs["weights_only"] = False
     return _orig_torch_load(*args, **kwargs)
 
 
 torch.load = _patched_torch_load
+torch.serialization.load = _patched_torch_load
 
 from numpy.typing import NDArray
 from pyannote.audio import Inference, Model
