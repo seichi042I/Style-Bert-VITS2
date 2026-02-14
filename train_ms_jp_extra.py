@@ -678,15 +678,6 @@ def run():
         # This prevents crashes without losing non-failing compiled graphs.
         torch._dynamo.config.suppress_errors = True
 
-        # Force synchronous Triton kernel compilation.  The default async
-        # mode dispatches compilations to subprocesses; errors raised there
-        # surface as SubprocException *after* Dynamo's compile_wrapper has
-        # returned, bypassing suppress_errors.  With compile_threads=1 the
-        # error occurs inside compile_wrapper where suppress_errors can
-        # intercept it and fall back to eager for the failing graph.
-        import torch._inductor.config as _inductor_cfg
-        _inductor_cfg.compile_threads = 1
-
         if not _skip_gen:
             net_g = torch.compile(net_g, mode=_compile_mode)
         net_d = torch.compile(net_d, mode=_compile_mode)

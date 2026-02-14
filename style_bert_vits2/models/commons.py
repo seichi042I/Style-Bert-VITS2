@@ -125,9 +125,8 @@ def subsequent_mask(length: int) -> torch.Tensor:
     return mask
 
 
-@torch.jit.script  # type: ignore
 def fused_add_tanh_sigmoid_multiply(
-    input_a: torch.Tensor, input_b: torch.Tensor, n_channels: torch.Tensor
+    input_a: torch.Tensor, input_b: torch.Tensor, n_channels: int
 ) -> torch.Tensor:
     """
     加算、tanh、sigmoid の活性化関数を組み合わせた演算を行う
@@ -135,15 +134,14 @@ def fused_add_tanh_sigmoid_multiply(
     Args:
         input_a (torch.Tensor): 入力テンソル A
         input_b (torch.Tensor): 入力テンソル B
-        n_channels (torch.Tensor): チャネル数
+        n_channels (int): チャネル数
 
     Returns:
         torch.Tensor: 演算結果
     """
-    n_channels_int = n_channels[0]
     in_act = input_a + input_b
-    t_act = torch.tanh(in_act[:, :n_channels_int, :])
-    s_act = torch.sigmoid(in_act[:, n_channels_int:, :])
+    t_act = torch.tanh(in_act[:, :n_channels, :])
+    s_act = torch.sigmoid(in_act[:, n_channels:, :])
     acts = t_act * s_act
     return acts
 

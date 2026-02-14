@@ -23,14 +23,12 @@ class LayerNorm(nn.Module):
         return x.transpose(1, -1)
 
 
-@torch.jit.script  # type: ignore
 def fused_add_tanh_sigmoid_multiply(
-    input_a: torch.Tensor, input_b: torch.Tensor, n_channels: list[int]
+    input_a: torch.Tensor, input_b: torch.Tensor, n_channels: int
 ) -> torch.Tensor:
-    n_channels_int = n_channels[0]
     in_act = input_a + input_b
-    t_act = torch.tanh(in_act[:, :n_channels_int, :])
-    s_act = torch.sigmoid(in_act[:, n_channels_int:, :])
+    t_act = torch.tanh(in_act[:, :n_channels, :])
+    s_act = torch.sigmoid(in_act[:, n_channels:, :])
     acts = t_act * s_act
     return acts
 
