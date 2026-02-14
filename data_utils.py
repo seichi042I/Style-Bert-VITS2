@@ -3,6 +3,7 @@ import random
 import sys
 import threading
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 
 import numpy as np
@@ -807,20 +808,25 @@ class PreCollatedBatchStore:
         n_batches = len(all_batch_indices)
         logger.info(f"Pre-collating {n_batches} batches...")
 
-        for batch_indices in tqdm(
-            all_batch_indices,
-            desc="Pre-collating batches",
-            file=sys.stdout,
-            dynamic_ncols=True,
-        ):
-            samples = [dataset[i] for i in batch_indices]
-            batch = collate_fn(samples)
-            self._total_bytes += sum(
-                t.nelement() * t.element_size()
-                for t in batch
-                if isinstance(t, torch.Tensor)
-            )
-            self._batches.append(batch)
+        # Parallelize sample loading with threads.  Each dataset[i] does
+        # 4 file reads (wav + spec.pt + bert.pt + npy) which are I/O-bound.
+        # Threads work well here because file I/O releases the GIL.
+        _n_io_workers = min(8, os.cpu_count() or 4)
+        with ThreadPoolExecutor(max_workers=_n_io_workers) as _io_pool:
+            for batch_indices in tqdm(
+                all_batch_indices,
+                desc="Pre-collating batches",
+                file=sys.stdout,
+                dynamic_ncols=True,
+            ):
+                samples = list(_io_pool.map(dataset.__getitem__, batch_indices))
+                batch = collate_fn(samples)
+                self._total_bytes += sum(
+                    t.nelement() * t.element_size()
+                    for t in batch
+                    if isinstance(t, torch.Tensor)
+                )
+                self._batches.append(batch)
 
         total_mb = self._total_bytes / (1024 * 1024)
         logger.info(
