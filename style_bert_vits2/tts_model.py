@@ -366,6 +366,20 @@ class TTSModel:
 
         if self.style_vector_inference is None:
 
+            # PyTorch 2.6+ の torch.load(weights_only=True) では pyannote チェックポイントが読めないためパッチ
+            import torch as _torch
+
+            if not hasattr(_torch, "_style_gen_torch_load_patched"):
+                _orig_load = _torch.load
+
+                def _patched_load(*args, **kwargs):
+                    kwargs = dict(kwargs)
+                    kwargs.setdefault("weights_only", False)
+                    return _orig_load(*args, **kwargs)
+
+                _torch.load = _patched_load
+                _torch._style_gen_torch_load_patched = True  # type: ignore[attr-defined]
+
             # pyannote.audio は scikit-learn などの大量の重量級ライブラリに依存しているため、
             # TTSModel.infer() に reference_audio_path を指定し音声からスタイルベクトルを推論する場合のみ遅延 import する
             try:
