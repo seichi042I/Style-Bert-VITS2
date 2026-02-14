@@ -350,6 +350,8 @@ def train(
     num_workers: int = 0,
     compile_model: bool = False,
     max_tokens: int = 0,
+    compile_mode: str = "default",
+    batch_size_override: int = 0,
 ):
     paths = get_path(model_name)
     # 学習再開の場合を考えて念のためconfig.ymlの名前等を更新
@@ -382,8 +384,12 @@ def train(
         cmd.extend(["--num_workers", str(num_workers)])
     if compile_model:
         cmd.append("--compile")
+        if compile_mode != "default":
+            cmd.extend(["--compile_mode", compile_mode])
     if max_tokens != 0:
         cmd.extend(["--max_tokens", str(max_tokens)])
+    if batch_size_override > 0:
+        cmd.extend(["--batch_size", str(batch_size_override)])
     success, message = run_script_with_log(cmd, ignore_warning=True)
     if not success:
         logger.error("Train failed.")
@@ -796,6 +802,12 @@ def create_train_app():
                     info="CUDAカーネルを融合しGPU使用率を向上。初回イテレーションのみコンパイルで数分かかります",
                     value=False,
                 )
+                compile_mode_train = gr.Dropdown(
+                    label="コンパイルモード",
+                    info="default: 安全。max-autotune: カーネル自動最適化+CUDA graph（初回コンパイルは長いがキャッシュされる）",
+                    choices=["default", "reduce-overhead", "max-autotune"],
+                    value="default",
+                )
             with gr.Row():
                 num_workers_train = gr.Slider(
                     label="DataLoaderワーカー数",
@@ -808,6 +820,12 @@ def create_train_app():
                 max_tokens_train = gr.Number(
                     label="バッチあたり最大フレーム数 (max_tokens)",
                     info="0で自動計算（batch_size×300）。長いシーケンスのバッチサイズを自動縮小してOOMを防止します。-1で無効化（全バケット均一batch_size）",
+                    value=0,
+                    precision=0,
+                )
+                batch_size_train = gr.Number(
+                    label="バッチサイズ上書き",
+                    info="0でconfig.jsonの値を使用。VRAMに余裕がある場合に増やすとGPU利用率が向上します",
                     value=0,
                     precision=0,
                 )
@@ -906,6 +924,8 @@ def create_train_app():
                 num_workers_train,
                 compile_train,
                 max_tokens_train,
+                compile_mode_train,
+                batch_size_train,
             ],
             outputs=[info_train],
         )

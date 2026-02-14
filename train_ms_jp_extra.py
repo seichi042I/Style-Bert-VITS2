@@ -684,14 +684,14 @@ def run():
         # This prevents crashes without losing non-failing compiled graphs.
         torch._dynamo.config.suppress_errors = True
 
-        # Static-shape compilation (dynamic=False, the default).
-        # The collate function now pads every batch to per-bucket ceiling
-        # dimensions, so torch.compile sees at most N_buckets unique shapes.
-        # Static-shape Triton kernels are more optimised than symbolic-shape
-        # ones and carry no runtime guard overhead.  After each bucket's
-        # first compilation the inductor cache on disk eliminates further
-        # compilation cost across training runs.
-        _compile_kw = dict(mode=_compile_mode)
+        # Use symbolic-shape (dynamic) compilation.
+        # The collate function pads to per-bucket ceiling dimensions, which
+        # stabilises VRAM (same-sized allocations hit the allocator free-list)
+        # and keeps CuDNN benchmark cache effective.
+        # dynamic=True generates shape-polymorphic Triton kernels on the
+        # first compilation so no per-shape recompilation is needed — only
+        # one compilation set (~2-3 min) instead of N_buckets sets (~20 min).
+        _compile_kw = dict(mode=_compile_mode, dynamic=True)
 
         if not _skip_gen:
             net_g = torch.compile(net_g, **_compile_kw)
@@ -1007,6 +1007,16 @@ def train_and_evaluate(
                 y, ids_slice * hps.data.hop_length, hps.train.segment_size
             )  # slice
 
+            # Pre-compute WavLM embeddings ONCE per step (2 forwards
+            # instead of 5).  Real-audio embeddings are always no_grad;
+            # fake-audio embeddings keep the autograd graph so that
+            # generator_from_emb / feature_loss_from_emb can back-prop
+            # through y_hat in the generator phase.
+            if net_wd is not None:
+                with torch.no_grad():
+                    _wav_emb = wl.wavlm_embed(y.squeeze(1))
+                _rec_emb = wl.wavlm_embed(y_hat.squeeze(1))
+
             # Discriminator
             y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
             loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
@@ -1042,9 +1052,9 @@ def train_and_evaluate(
                 else:
                     optim_dur_disc.step()
             if net_wd is not None:
-                # shape: (batch, 1, time)
-                loss_slm = wl.discriminator(
-                    y.detach().squeeze(1), y_hat.detach().squeeze(1)
+                # Discriminator loss from cached embeddings (detached fake)
+                loss_slm = wl.discriminator_from_emb(
+                    _wav_emb, [e.detach() for e in _rec_emb]
                 ).mean()
 
                 optim_wd.zero_grad(set_to_none=True)
@@ -1079,8 +1089,9 @@ def train_and_evaluate(
             if net_dur_disc is not None:
                 _, y_dur_hat_g = net_dur_disc(hidden_x, x_mask, logw_, logw, g)
             if net_wd is not None:
-                loss_lm = wl(y.detach().squeeze(1), y_hat.squeeze(1)).mean()
-                loss_lm_gen = wl.generator(y_hat.squeeze(1))
+                # Reuse cached WavLM embeddings (grad-enabled for generator)
+                loss_lm = wl.feature_loss_from_emb(_wav_emb, _rec_emb).mean()
+                loss_lm_gen = wl.generator_from_emb(_rec_emb)
             loss_dur = torch.sum(l_length.float())
             loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
             loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl

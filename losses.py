@@ -151,3 +151,45 @@ class WavLMLoss(torch.nn.Module):
         y_d_rs = self.wd(y_embeddings)
 
         return y_d_rs
+
+    # ------------------------------------------------------------------
+    # Cached-embedding API: compute WavLM hidden states once per step
+    # and reuse across discriminator / feature-loss / generator calls.
+    # Reduces WavLM forward passes from 5 to 2 per training step.
+    # ------------------------------------------------------------------
+
+    def wavlm_embed(self, audio):
+        """Resample *audio* to 16 kHz and return WavLM hidden states (tuple of tensors)."""
+        audio_16 = self.resample(audio)
+        return self.wavlm(
+            input_values=audio_16, output_hidden_states=True
+        ).hidden_states
+
+    @staticmethod
+    def _flatten_emb(emb):
+        """Stack hidden states → (B, hidden*layers, T)."""
+        return (
+            torch.stack(list(emb), dim=1)
+            .transpose(-1, -2)
+            .flatten(start_dim=1, end_dim=2)
+        )
+
+    def discriminator_from_emb(self, wav_emb, rec_emb):
+        """Discriminator loss from pre-computed (detached) embeddings."""
+        y_d_rs = self.wd(self._flatten_emb(wav_emb))
+        y_d_gs = self.wd(self._flatten_emb(rec_emb))
+        r_loss = torch.mean((1 - y_d_rs) ** 2)
+        g_loss = torch.mean(y_d_gs ** 2)
+        return r_loss + g_loss
+
+    def feature_loss_from_emb(self, wav_emb, rec_emb):
+        """L1 feature-matching loss from pre-computed embeddings."""
+        floss = 0
+        for er, eg in zip(wav_emb, rec_emb):
+            floss += torch.mean(torch.abs(er - eg))
+        return floss
+
+    def generator_from_emb(self, rec_emb):
+        """Generator adversarial loss from pre-computed embeddings."""
+        y_df_hat_g = self.wd(self._flatten_emb(rec_emb))
+        return torch.mean((1 - y_df_hat_g) ** 2)
