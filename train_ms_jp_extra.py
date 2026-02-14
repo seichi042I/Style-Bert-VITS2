@@ -926,6 +926,8 @@ def train_and_evaluate(
         net_dur_disc.train()
     if net_wd is not None:
         net_wd.train()
+    import time as _time
+    _t_prev_iter_end = _time.perf_counter()
     for batch_idx, (
         x,
         x_lengths,
@@ -939,6 +941,8 @@ def train_and_evaluate(
         bert,
         style_vec,
     ) in enumerate(train_loader):
+        _t_data_ready = _time.perf_counter()
+        _t_data_wait = _t_data_ready - _t_prev_iter_end
         if net_g.module.use_noise_scaled_mas:
             current_mas_noise_scale = (
                 net_g.module.mas_noise_scale_initial
@@ -962,6 +966,7 @@ def train_and_evaluate(
 
         # --- Use autocast only when bf16 is enabled; skip the wrapper for FP32 ---
         _use_bf16 = hps.train.bf16_run
+        _t_fwd_start = _time.perf_counter()
         with autocast(enabled=_use_bf16, dtype=torch.bfloat16):
             (
                 y_hat,
@@ -984,6 +989,8 @@ def train_and_evaluate(
                 bert,
                 style_vec,
             )
+            torch.cuda.synchronize()
+            _t_after_gen_fwd = _time.perf_counter()
             mel = spec_to_mel_torch(
                 spec,
                 hps.data.filter_length,
@@ -1111,6 +1118,20 @@ def train_and_evaluate(
             scaler.update()
         else:
             optim_g.step()
+
+        torch.cuda.synchronize()
+        _t_prev_iter_end = _time.perf_counter()
+        _t_total = _t_prev_iter_end - _t_data_ready
+        _t_gen_fwd = _t_after_gen_fwd - _t_fwd_start
+        _t_rest = _t_prev_iter_end - _t_after_gen_fwd
+        if _t_total > 1.0 or _t_data_wait > 0.5:
+            logger.warning(
+                f"SLOW step {global_step}: "
+                f"data={_t_data_wait:.3f}s "
+                f"gen_fwd={_t_gen_fwd:.3f}s "
+                f"disc+bwd+opt={_t_rest:.3f}s "
+                f"total={_t_total:.3f}s"
+            )
 
         if rank == 0:
             if global_step % hps.train.log_interval == 0 and not hps.speedup:
