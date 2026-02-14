@@ -152,6 +152,15 @@ def run():
         help="Use torch.compile to optimize model execution (fuses kernels, reduces overhead).",
     )
     parser.add_argument(
+        "--compile_mode",
+        type=str,
+        default="default",
+        choices=["default", "reduce-overhead", "max-autotune"],
+        help="torch.compile backend mode. 'default' is safest; 'reduce-overhead' "
+             "adds CUDA graphs; 'max-autotune' is aggressive but may fail on "
+             "models with dynamic shapes (e.g. nonzero, cpu ops).",
+    )
+    parser.add_argument(
         "--max_tokens",
         type=int,
         default=None,
@@ -232,6 +241,7 @@ def run():
         f"num_workers={num_workers}, prefetch_factor={prefetch_factor}, "
         f"bf16={hps.train.bf16_run}, cache_in_memory={args.cache_in_memory}, "
         f"compile={args.compile}"
+        + (f" (mode={args.compile_mode})" if args.compile else "")
     )
 
     # 比较路径是否相同
@@ -636,20 +646,25 @@ def run():
             epoch_str = 1
             global_step = 0
 
-    # torch.compile with max-autotune: enables Triton-based kernel selection,
-    # automatic CUDA graphs, and aggressive operator fusion for Tensor Cores.
+    # torch.compile: fuse CUDA kernels to reduce launch overhead.
     # Applied AFTER checkpoint loading to avoid _orig_mod prefix mismatch.
     if getattr(args, "compile", False):
+        _compile_mode = getattr(args, "compile_mode", "default")
         logger.info(
-            "Compiling models with torch.compile (mode=max-autotune). "
+            f"Compiling models with torch.compile (mode={_compile_mode}). "
             "First iteration will be slow due to compilation..."
         )
-        net_g = torch.compile(net_g, mode="max-autotune")
-        net_d = torch.compile(net_d, mode="max-autotune")
+        # Enable inductor compilation progress logging so the user can
+        # see that work is happening (GPU utilization is 0% during compile).
+        import logging as _logging
+        _logging.getLogger("torch._inductor").setLevel(_logging.INFO)
+        _logging.getLogger("torch._dynamo").setLevel(_logging.WARNING)
+        net_g = torch.compile(net_g, mode=_compile_mode)
+        net_d = torch.compile(net_d, mode=_compile_mode)
         if net_dur_disc is not None:
-            net_dur_disc = torch.compile(net_dur_disc, mode="max-autotune")
+            net_dur_disc = torch.compile(net_dur_disc, mode=_compile_mode)
         if net_wd is not None:
-            net_wd = torch.compile(net_wd, mode="max-autotune")
+            net_wd = torch.compile(net_wd, mode=_compile_mode)
 
     def lr_lambda(epoch):
         """
