@@ -161,6 +161,13 @@ def run():
              "models with dynamic shapes (e.g. nonzero, cpu ops).",
     )
     parser.add_argument(
+        "--compile_skip_generator",
+        action="store_true",
+        help="Skip torch.compile for the generator (net_g). Use this if compilation "
+             "crashes due to dynamic ops (nonzero, CPU monotonic alignment). "
+             "Discriminators will still be compiled.",
+    )
+    parser.add_argument(
         "--max_tokens",
         type=int,
         default=None,
@@ -650,16 +657,29 @@ def run():
     # Applied AFTER checkpoint loading to avoid _orig_mod prefix mismatch.
     if getattr(args, "compile", False):
         _compile_mode = getattr(args, "compile_mode", "default")
+        _skip_gen = getattr(args, "compile_skip_generator", False)
         logger.info(
             f"Compiling models with torch.compile (mode={_compile_mode}). "
             "First iteration will be slow due to compilation..."
         )
+        if _skip_gen:
+            logger.info(
+                "Skipping generator compilation (--compile_skip_generator). "
+                "Only discriminators will be compiled."
+            )
         # Enable inductor compilation progress logging so the user can
         # see that work is happening (GPU utilization is 0% during compile).
         import logging as _logging
         _logging.getLogger("torch._inductor").setLevel(_logging.INFO)
         _logging.getLogger("torch._dynamo").setLevel(_logging.WARNING)
-        net_g = torch.compile(net_g, mode=_compile_mode)
+
+        # Automatically fall back to eager execution if Triton/inductor
+        # compilation fails at runtime (e.g. PassManager::run failures).
+        # This prevents crashes without losing non-failing compiled graphs.
+        torch._dynamo.config.suppress_errors = True
+
+        if not _skip_gen:
+            net_g = torch.compile(net_g, mode=_compile_mode)
         net_d = torch.compile(net_d, mode=_compile_mode)
         if net_dur_disc is not None:
             net_dur_disc = torch.compile(net_dur_disc, mode=_compile_mode)

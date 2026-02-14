@@ -80,7 +80,6 @@ def spectrogram_torch(y, n_fft, sampling_rate, hop_size, win_size, center=False)
     return spec
 
 
-@torch.compile
 def spec_to_mel_torch(spec, n_fft, num_mels, sampling_rate, fmin, fmax):
     global mel_basis
     dtype_device = str(spec.dtype) + "_" + str(spec.device)
@@ -97,7 +96,6 @@ def spec_to_mel_torch(spec, n_fft, num_mels, sampling_rate, fmin, fmax):
     return spec
 
 
-@torch.compile
 def mel_spectrogram_torch(
     y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin, fmax, center=False
 ):

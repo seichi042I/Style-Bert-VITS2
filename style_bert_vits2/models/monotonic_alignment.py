@@ -1,4 +1,10 @@
 """
+Monotonic alignment maximum-path algorithm (Numba JIT).
+
+Decorated with ``@torch.compiler.disable`` so that ``torch.compile`` treats
+this function as a graph-break — the rest of the model can still be compiled
+while this function runs via Numba on CPU as before.
+
 以下に記述されている関数のコメントはリファクタリング時に GPT-4 に生成させたもので、
 コードと完全に一致している保証はない。あくまで参考程度とすること。
 """
@@ -10,6 +16,7 @@ import torch
 from numpy import float32, int32, zeros
 
 
+@torch.compiler.disable
 def maximum_path(neg_cent: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """
     与えられた負の中心とマスクを使用して最大パスを計算する
