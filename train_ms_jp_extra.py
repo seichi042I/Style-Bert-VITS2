@@ -677,7 +677,9 @@ def run():
 
         # Log recompilation events to diagnose intermittent stalls.
         # Level 2 = verbose (shows guard failure reason + old/new values).
-        import torch._logging
+        # NOTE: torch is already imported globally; do NOT use
+        # ``import torch._logging`` here — it would shadow the global
+        # ``torch`` binding for the entire function scope (Python scoping).
         torch._logging.set_logs(recompiles=2, graph_breaks=True)
 
         # Automatically fall back to eager execution if Triton/inductor
