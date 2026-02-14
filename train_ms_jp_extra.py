@@ -678,13 +678,24 @@ def run():
         # This prevents crashes without losing non-failing compiled graphs.
         torch._dynamo.config.suppress_errors = True
 
+        # Use symbolic-shape (dynamic) compilation from the start.
+        # The bucket sampler produces diverse (T_x, T_y) shapes each
+        # iteration.  Without dynamic=True the default automatic-dynamic
+        # heuristic recompiles 2-3 times per Dynamo frame before settling
+        # on dynamic kernels — multiplied by many frames (graph breaks at
+        # monotonic_alignment, etc.) and 4 compiled models, this creates
+        # minutes of compilation overhead on every early iteration.
+        # dynamic=True generates shape-polymorphic Triton kernels on the
+        # first compilation so no recompilation is needed afterwards.
+        _compile_kw = dict(mode=_compile_mode, dynamic=True)
+
         if not _skip_gen:
-            net_g = torch.compile(net_g, mode=_compile_mode)
-        net_d = torch.compile(net_d, mode=_compile_mode)
+            net_g = torch.compile(net_g, **_compile_kw)
+        net_d = torch.compile(net_d, **_compile_kw)
         if net_dur_disc is not None:
-            net_dur_disc = torch.compile(net_dur_disc, mode=_compile_mode)
+            net_dur_disc = torch.compile(net_dur_disc, **_compile_kw)
         if net_wd is not None:
-            net_wd = torch.compile(net_wd, mode=_compile_mode)
+            net_wd = torch.compile(net_wd, **_compile_kw)
 
     def lr_lambda(epoch):
         """
