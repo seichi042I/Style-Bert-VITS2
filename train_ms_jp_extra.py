@@ -671,7 +671,14 @@ def run():
         # see that work is happening (GPU utilization is 0% during compile).
         import logging as _logging
         _logging.getLogger("torch._inductor").setLevel(_logging.INFO)
-        _logging.getLogger("torch._dynamo").setLevel(_logging.WARNING)
+        # INFO level captures suppress_errors fallback messages ("WON'T
+        # CONVERT") and recompilation triggers — both cause stalls.
+        _logging.getLogger("torch._dynamo").setLevel(_logging.INFO)
+
+        # Log recompilation events to diagnose intermittent stalls.
+        # Level 2 = verbose (shows guard failure reason + old/new values).
+        import torch._logging
+        torch._logging.set_logs(recompiles=2, graph_breaks=True)
 
         # Automatically fall back to eager execution if Triton/inductor
         # compilation fails at runtime (e.g. PassManager::run failures).
