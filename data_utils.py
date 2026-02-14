@@ -78,6 +78,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
 
         audiopaths_sid_text_new = []
         lengths = []
+        text_lengths = []
         skipped = 0
         skipped_reasons: dict[str, list[str]] = {
             "missing_npy": [],
@@ -123,6 +124,10 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
                 [audiopath, spk, language, text, phones, tone, word2ph]
             )
             lengths.append(os.path.getsize(audiopath) // (2 * self.hop_length))
+            # cleaned_text_to_sequence is 1:1 (phone count unchanged).
+            # add_blank inserts a blank between every phone plus one at the start.
+            n_phones = len(phones)
+            text_lengths.append(2 * n_phones + 1 if self.add_blank else n_phones)
 
         for reason, paths in skipped_reasons.items():
             if paths:
@@ -132,6 +137,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         )
         self.audiopaths_sid_text = audiopaths_sid_text_new
         self.lengths = lengths
+        self.text_lengths = text_lengths
         # 話者名をインデックスごとに保持（バケットサンプラーの話者均等化に利用）
         self.speakers = [x[1] for x in self.audiopaths_sid_text]
 
@@ -279,9 +285,17 @@ def _round_up(x: int, granularity: int) -> int:
 class TextAudioSpeakerCollate:
     """Zero-pads model inputs and targets"""
 
-    def __init__(self, return_ids=False, use_jp_extra=False):
+    def __init__(self, return_ids=False, use_jp_extra=False, shape_ceilings=None):
         self.return_ids = return_ids
         self.use_jp_extra = use_jp_extra
+        # shape_ceilings: list of (text_ceil, spec_ceil, wav_ceil) sorted by
+        # spec_ceil ascending.  When set, pad to the smallest ceiling that
+        # covers the batch's max spec, guaranteeing identical tensor shapes
+        # for every batch from the same bucket.
+        if shape_ceilings is not None:
+            self._shape_ceilings = sorted(shape_ceilings, key=lambda x: x[1])
+        else:
+            self._shape_ceilings = None
 
     def __call__(self, batch):
         """Collate's training batch from normalized text, audio and speaker identities
@@ -294,20 +308,41 @@ class TextAudioSpeakerCollate:
             torch.LongTensor([x[1].size(1) for x in batch]), dim=0, descending=True
         )
 
-        # Round up to fixed granularity so that tensor shapes are reused
-        # across batches.  This stabilizes VRAM usage in three ways:
-        #   1. The CUDA caching allocator can reuse memory blocks more often
-        #      (same-sized allocations hit the free-list instead of splitting).
-        #   2. CuDNN benchmark mode caches fewer algorithm configurations
-        #      (fewer unique shapes → fewer workspace allocations).
-        #   3. Intermediate activations keep a consistent footprint.
+        # Determine padded dimensions.
+        # When shape_ceilings are set (bucket-sampler mode with torch.compile),
+        # snap to the precomputed ceiling so that every batch from the same
+        # bucket produces identical tensor shapes — enabling static-shape
+        # compilation with no recompilation after warmup.
         _PAD_TEXT = 32
         _PAD_SPEC = 32
         _PAD_WAV = 512
 
-        max_text_len = _round_up(max(len(x[0]) for x in batch), _PAD_TEXT)
-        max_spec_len = _round_up(max(x[1].size(1) for x in batch), _PAD_SPEC)
-        max_wav_len = _round_up(max(x[2].size(1) for x in batch), _PAD_WAV)
+        raw_max_text = max(len(x[0]) for x in batch)
+        raw_max_spec = max(x[1].size(1) for x in batch)
+        raw_max_wav = max(x[2].size(1) for x in batch)
+
+        if self._shape_ceilings is not None:
+            for text_c, spec_c, wav_c in self._shape_ceilings:
+                if spec_c >= raw_max_spec:
+                    max_text_len = text_c
+                    max_spec_len = spec_c
+                    max_wav_len = wav_c
+                    # Safety: clamp to actual max if ceiling is somehow too small
+                    # (should not happen with correctly computed ceilings).
+                    if raw_max_text > text_c:
+                        max_text_len = _round_up(raw_max_text, _PAD_TEXT)
+                    if raw_max_wav > wav_c:
+                        max_wav_len = _round_up(raw_max_wav, _PAD_WAV)
+                    break
+            else:
+                # Batch exceeds all ceilings — fall back to round-up
+                max_text_len = _round_up(raw_max_text, _PAD_TEXT)
+                max_spec_len = _round_up(raw_max_spec, _PAD_SPEC)
+                max_wav_len = _round_up(raw_max_wav, _PAD_WAV)
+        else:
+            max_text_len = _round_up(raw_max_text, _PAD_TEXT)
+            max_spec_len = _round_up(raw_max_spec, _PAD_SPEC)
+            max_wav_len = _round_up(raw_max_wav, _PAD_WAV)
 
         # Lengths / IDs — fully assigned in the loop, no need to zero
         text_lengths = torch.empty(len(batch), dtype=torch.long)
@@ -459,6 +494,37 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
                 for r, bs in zip(bucket_ranges, self._batch_sizes)
             )
         )
+
+        # --- Static-shape ceilings for torch.compile(dynamic=False) ---
+        # By padding every batch from the same bucket to identical fixed
+        # dimensions, torch.compile sees at most N_buckets unique shapes
+        # and never recompiles after the initial warmup.
+        _text_lengths = getattr(dataset, "text_lengths", None)
+        _hop_length = getattr(dataset, "hop_length", None)
+        if _text_lengths is not None and _hop_length is not None:
+            _PAD_T = 32   # text granularity
+            _PAD_S = 32   # spec granularity
+            _PAD_W = 512  # wav granularity
+            self.shape_ceilings = []  # [(text_ceil, spec_ceil, wav_ceil), ...]
+            for i, bucket in enumerate(self.buckets):
+                spec_ceil = _round_up(self.boundaries[i + 1], _PAD_S)
+                max_text = max(_text_lengths[idx] for idx in bucket)
+                text_ceil = _round_up(max_text, _PAD_T)
+                # wav ≈ spec * hop_length.  +hop_length for STFT edge margin.
+                wav_ceil = _round_up(
+                    self.boundaries[i + 1] * _hop_length + _hop_length, _PAD_W
+                )
+                self.shape_ceilings.append((text_ceil, spec_ceil, wav_ceil))
+            logger.info(
+                "Shape ceilings (text, spec, wav): "
+                + ", ".join(
+                    f"[{self.boundaries[i]}-{self.boundaries[i+1]}]="
+                    f"({t},{s},{w})"
+                    for i, (t, s, w) in enumerate(self.shape_ceilings)
+                )
+            )
+        else:
+            self.shape_ceilings = None
 
         self.total_size = sum(self.num_samples_per_bucket)
         self.num_samples = self.total_size // self.num_replicas

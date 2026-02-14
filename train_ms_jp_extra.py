@@ -331,7 +331,6 @@ def run():
     #   - PreCollatedBatchStore path: batches stay pageable; bulk-pinning all
     #     training data would waste physical RAM (page-locked memory cannot be
     #     swapped by the OS).
-    collate_fn = TextAudioSpeakerCollate(use_jp_extra=True)
     if not args.not_use_custom_batch_sampler:
         train_sampler = DistributedBucketSampler(
             train_dataset,
@@ -341,6 +340,13 @@ def run():
             rank=rank,
             shuffle=True,
             max_batch_frames=args.max_tokens,
+        )
+        # Pass per-bucket shape ceilings to the collate function so that
+        # every batch from the same bucket produces identical tensor shapes.
+        # This enables torch.compile(dynamic=False) static-shape compilation.
+        collate_fn = TextAudioSpeakerCollate(
+            use_jp_extra=True,
+            shape_ceilings=train_sampler.shape_ceilings,
         )
         if args.cache_in_memory:
             train_loader = PreCollatedBatchStore(
@@ -358,6 +364,7 @@ def run():
                 prefetch_factor=prefetch_factor,
             )
     else:
+        collate_fn = TextAudioSpeakerCollate(use_jp_extra=True)
         train_sampler = DistributedLengthGroupedSampler(
             dataset=train_dataset,
             batch_size=hps.train.batch_size,
@@ -677,16 +684,14 @@ def run():
         # This prevents crashes without losing non-failing compiled graphs.
         torch._dynamo.config.suppress_errors = True
 
-        # Use symbolic-shape (dynamic) compilation from the start.
-        # The bucket sampler produces diverse (T_x, T_y) shapes each
-        # iteration.  Without dynamic=True the default automatic-dynamic
-        # heuristic recompiles 2-3 times per Dynamo frame before settling
-        # on dynamic kernels — multiplied by many frames (graph breaks at
-        # monotonic_alignment, etc.) and 4 compiled models, this creates
-        # minutes of compilation overhead on every early iteration.
-        # dynamic=True generates shape-polymorphic Triton kernels on the
-        # first compilation so no recompilation is needed afterwards.
-        _compile_kw = dict(mode=_compile_mode, dynamic=True)
+        # Static-shape compilation (dynamic=False, the default).
+        # The collate function now pads every batch to per-bucket ceiling
+        # dimensions, so torch.compile sees at most N_buckets unique shapes.
+        # Static-shape Triton kernels are more optimised than symbolic-shape
+        # ones and carry no runtime guard overhead.  After each bucket's
+        # first compilation the inductor cache on disk eliminates further
+        # compilation cost across training runs.
+        _compile_kw = dict(mode=_compile_mode)
 
         if not _skip_gen:
             net_g = torch.compile(net_g, **_compile_kw)
