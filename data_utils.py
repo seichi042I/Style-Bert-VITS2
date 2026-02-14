@@ -419,6 +419,7 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
         num_replicas=None,
         rank=None,
         shuffle=True,
+        max_batch_frames=None,
     ):
         super().__init__(dataset, num_replicas=num_replicas, rank=rank, shuffle=shuffle)
         self.lengths = dataset.lengths
@@ -427,13 +428,37 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
         # 話者均等化: データセットが話者情報を持つ場合のみ使用
         self.speakers = getattr(dataset, "speakers", None)
 
+        # Per-bucket VRAM budget: バケットごとにバッチサイズを調整して
+        # 長いシーケンスでの OOM を防ぐ。アテンション層のメモリ使用量は
+        # O(B * L²) で増加するため、B * L を一定に保つことで VRAM 消費を
+        # バケット間でおおむね均一にする。
+        if max_batch_frames is None:
+            # 自動計算: 設定された batch_size は最短バケットに適用し、
+            # 長いバケットは比例的に縮小する
+            ref_length = boundaries[1] if len(boundaries) > 1 else boundaries[-1]
+            self._max_batch_frames = batch_size * ref_length
+        elif max_batch_frames <= 0:
+            # 明示的に無効化（全バケットで均一の batch_size を使用）
+            self._max_batch_frames = None
+        else:
+            self._max_batch_frames = max_batch_frames
+
         self.buckets, self.num_samples_per_bucket = self._create_buckets()
         logger.info(f"Bucket info: {self.num_samples_per_bucket}")
-        # logger.info(
-        #     f"Unused samples: {len(self.lengths) - sum(self.num_samples_per_bucket)}"
-        # )
-        # ↑マイナスになることあるし、別にこれは使われないサンプル数ではないようだ……
-        # バケットの仕組みはよく分からない
+        bucket_ranges = [
+            f"{self.boundaries[i]}-{self.boundaries[i+1]}"
+            for i in range(len(self._batch_sizes))
+        ]
+        logger.info(
+            "Per-bucket batch sizes"
+            + (f" (max_batch_frames={self._max_batch_frames})"
+               if self._max_batch_frames is not None else " (uniform)")
+            + ": "
+            + ", ".join(
+                f"[{r}]={bs}"
+                for r, bs in zip(bucket_ranges, self._batch_sizes)
+            )
+        )
 
         self.total_size = sum(self.num_samples_per_bucket)
         self.num_samples = self.total_size // self.num_replicas
@@ -460,10 +485,23 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
                     buckets.pop(i)
                     self.boundaries.pop(i + 1)
 
+        # バケットごとのバッチサイズを算出
+        self._batch_sizes = []
+        for i in range(len(buckets)):
+            bucket_max_len = self.boundaries[i + 1]
+            if self._max_batch_frames is not None:
+                effective_bs = max(
+                    1,
+                    min(self.batch_size, self._max_batch_frames // bucket_max_len),
+                )
+            else:
+                effective_bs = self.batch_size
+            self._batch_sizes.append(effective_bs)
+
         num_samples_per_bucket = []
         for i in range(len(buckets)):
             len_bucket = len(buckets[i])
-            total_batch_size = self.num_replicas * self.batch_size
+            total_batch_size = self.num_replicas * self._batch_sizes[i]
             rem = (
                 total_batch_size - (len_bucket % total_batch_size)
             ) % total_batch_size
@@ -517,6 +555,7 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
                 continue
             ids_bucket = indices[i]
             num_samples_bucket = self.num_samples_per_bucket[i]
+            batch_size_i = self._batch_sizes[i]
 
             # add extra samples to make it evenly divisible
             rem = num_samples_bucket - len_bucket
@@ -529,12 +568,12 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
             # subsample
             ids_bucket = ids_bucket[self.rank :: self.num_replicas]
 
-            # batching
-            for j in range(len(ids_bucket) // self.batch_size):
+            # batching (per-bucket batch size for VRAM safety)
+            for j in range(len(ids_bucket) // batch_size_i):
                 batch = [
                     bucket[idx]
                     for idx in ids_bucket[
-                        j * self.batch_size : (j + 1) * self.batch_size
+                        j * batch_size_i : (j + 1) * batch_size_i
                     ]
                 ]
                 batches.append(batch)
@@ -544,7 +583,6 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
             batches = [batches[i] for i in batch_ids]
         self.batches = batches
 
-        assert len(self.batches) * self.batch_size == self.num_samples
         return iter(self.batches)
 
     def _bisect(self, x, lo=0, hi=None):
@@ -563,7 +601,10 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
             return -1
 
     def __len__(self):
-        return self.num_samples // self.batch_size
+        return sum(
+            ns // self.num_replicas // bs
+            for ns, bs in zip(self.num_samples_per_bucket, self._batch_sizes)
+        )
 
 
 _PREFETCH_SENTINEL = object()
@@ -723,7 +764,7 @@ class PreCollatedBatchStore:
     # ------------------------------------------------------------------
     # Call AFTER model / optimizer / DDP are on GPU
     # ------------------------------------------------------------------
-    def transfer_to_device(self, local_rank, max_vram_usage_ratio=0.7):
+    def transfer_to_device(self, local_rank, max_vram_usage_ratio=0.45):
         """
         Strategy A: data fits in VRAM → move pageable → VRAM in-place.
         Strategy B: VRAM insufficient → keep pageable, prefetch via

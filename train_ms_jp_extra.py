@@ -141,6 +141,14 @@ def run():
         action="store_true",
         help="Use torch.compile to optimize model execution (fuses kernels, reduces overhead).",
     )
+    parser.add_argument(
+        "--max_tokens",
+        type=int,
+        default=None,
+        help="Maximum frames-per-batch budget.  Longer sequences automatically "
+             "get smaller batch sizes to prevent OOM.  Default: auto "
+             "(batch_size * 300).  Set to -1 to disable dynamic scaling.",
+    )
     args = parser.parse_args()
 
     # Set log file
@@ -305,6 +313,7 @@ def run():
             num_replicas=n_gpus,
             rank=rank,
             shuffle=True,
+            max_batch_frames=args.max_tokens,
         )
         if args.cache_in_memory:
             train_loader = PreCollatedBatchStore(
@@ -519,6 +528,18 @@ def run():
             device_ids=[local_rank],
             bucket_cap_mb=512,
             gradient_as_bucket_view=True,
+        )
+
+    # モデル/オプティマイザ/DDP 確保後の VRAM 状態をログに出力
+    if torch.cuda.is_available():
+        free_vram, total_vram = torch.cuda.mem_get_info(local_rank)
+        free_gb = free_vram / (1024**3)
+        total_gb = total_vram / (1024**3)
+        used_gb = total_gb - free_gb
+        logger.info(
+            f"VRAM after model setup: {used_gb:.1f} GiB used / "
+            f"{total_gb:.1f} GiB total "
+            f"({free_gb:.1f} GiB free for activations + batch data)"
         )
 
     if utils.is_resuming(model_dir):

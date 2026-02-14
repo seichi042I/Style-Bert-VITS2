@@ -213,11 +213,12 @@ def infer(
         x_tst = phones.to(device).unsqueeze(0)
         tones = tones.to(device).unsqueeze(0)
         lang_ids = lang_ids.to(device).unsqueeze(0)
-        bert = bert.to(device).unsqueeze(0)
-        ja_bert = ja_bert.to(device).unsqueeze(0)
-        en_bert = en_bert.to(device).unsqueeze(0)
+        # BERT が float16 で出力する場合、net_g の float32 Conv と dtype が一致しないため float32 に統一する
+        bert = bert.to(device, dtype=torch.float32).unsqueeze(0)
+        ja_bert = ja_bert.to(device, dtype=torch.float32).unsqueeze(0)
+        en_bert = en_bert.to(device, dtype=torch.float32).unsqueeze(0)
         x_tst_lengths = torch.LongTensor([phones.size(0)]).to(device)
-        style_vec_tensor = torch.from_numpy(style_vec).to(device).unsqueeze(0)
+        style_vec_tensor = torch.from_numpy(style_vec).to(device, dtype=torch.float32).unsqueeze(0)
         del phones
         sid_tensor = torch.LongTensor([sid]).to(device)
 

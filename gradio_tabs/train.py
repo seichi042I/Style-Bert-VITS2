@@ -349,6 +349,7 @@ def train(
     bf16: bool = False,
     num_workers: int = 0,
     compile_model: bool = False,
+    max_tokens: int = 0,
 ):
     paths = get_path(model_name)
     # 学習再開の場合を考えて念のためconfig.ymlの名前等を更新
@@ -381,6 +382,8 @@ def train(
         cmd.extend(["--num_workers", str(num_workers)])
     if compile_model:
         cmd.append("--compile")
+    if max_tokens != 0:
+        cmd.extend(["--max_tokens", str(max_tokens)])
     success, message = run_script_with_log(cmd, ignore_warning=True)
     if not success:
         logger.error("Train failed.")
@@ -802,6 +805,12 @@ def create_train_app():
                     maximum=cpu_count(),
                     step=1,
                 )
+                max_tokens_train = gr.Number(
+                    label="バッチあたり最大フレーム数 (max_tokens)",
+                    info="0で自動計算（batch_size×300）。長いシーケンスのバッチサイズを自動縮小してOOMを防止します。-1で無効化（全バケット均一batch_size）",
+                    value=0,
+                    precision=0,
+                )
         with gr.Row():
             train_btn = gr.Button(value="学習を開始する", variant="primary")
             tensorboard_btn = gr.Button(value="Tensorboardを開く")
@@ -896,6 +905,7 @@ def create_train_app():
                 bf16_train,
                 num_workers_train,
                 compile_train,
+                max_tokens_train,
             ],
             outputs=[info_train],
         )
