@@ -500,20 +500,6 @@ def run():
     else:
         optim_wd = None
 
-    # torch.compile with max-autotune: enables Triton-based kernel selection,
-    # automatic CUDA graphs, and aggressive operator fusion for Tensor Cores.
-    if getattr(args, "compile", False):
-        logger.info(
-            "Compiling models with torch.compile (mode=max-autotune). "
-            "First iteration will be slow due to compilation..."
-        )
-        net_g = torch.compile(net_g, mode="max-autotune")
-        net_d = torch.compile(net_d, mode="max-autotune")
-        if net_dur_disc is not None:
-            net_dur_disc = torch.compile(net_dur_disc, mode="max-autotune")
-        if net_wd is not None:
-            net_wd = torch.compile(net_wd, mode="max-autotune")
-
     net_g = DDP(
         net_g,
         device_ids=[local_rank],
@@ -649,6 +635,21 @@ def run():
         finally:
             epoch_str = 1
             global_step = 0
+
+    # torch.compile with max-autotune: enables Triton-based kernel selection,
+    # automatic CUDA graphs, and aggressive operator fusion for Tensor Cores.
+    # Applied AFTER checkpoint loading to avoid _orig_mod prefix mismatch.
+    if getattr(args, "compile", False):
+        logger.info(
+            "Compiling models with torch.compile (mode=max-autotune). "
+            "First iteration will be slow due to compilation..."
+        )
+        net_g = torch.compile(net_g, mode="max-autotune")
+        net_d = torch.compile(net_d, mode="max-autotune")
+        if net_dur_disc is not None:
+            net_dur_disc = torch.compile(net_dur_disc, mode="max-autotune")
+        if net_wd is not None:
+            net_wd = torch.compile(net_wd, mode="max-autotune")
 
     def lr_lambda(epoch):
         """
