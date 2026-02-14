@@ -4,10 +4,15 @@ import os
 import platform
 from concurrent.futures import ThreadPoolExecutor
 
-# Optimize CUDA memory allocator to reduce fragmentation with large batches
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# Optimize CUDA memory allocator: expandable_segments reduces fragmentation,
+# max_split_size_mb=512 prevents excessive splitting with 96GB+ VRAM GPUs.
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "expandable_segments:True,max_split_size_mb:512",
+)
 
 import torch
+import torch._dynamo
 import torch.distributed as dist
 from huggingface_hub import HfApi
 from torch.cuda.amp import GradScaler, autocast
@@ -55,6 +60,10 @@ torch.backends.cuda.enable_mem_efficient_sdp(
     True
 )  # Not available if torch version is lower than 2.0
 torch.backends.cudnn.benchmark = True
+# cuBLASLt: select Tensor Core-optimized GEMM kernels (Blackwell / Ampere+)
+torch.backends.cuda.preferred_blas_library("cublaslt")
+# Expand dynamo graph cache for bucket sampler's diverse batch shapes
+torch._dynamo.config.cache_size_limit = 256
 
 config = get_config()
 global_step = 0
@@ -123,7 +132,8 @@ def run():
         "--batch_size",
         type=int,
         default=None,
-        help="Override batch size from config (e.g., 32 or 64 for large VRAM GPUs).",
+        help="Override batch size from config. For large VRAM GPUs (e.g., 96GB RTX PRO 6000), "
+             "try 32-64 to improve GPU utilization.",
     )
     parser.add_argument(
         "--num_workers",
@@ -490,18 +500,19 @@ def run():
     else:
         optim_wd = None
 
-    # torch.compile: fuse CUDA kernels to reduce launch overhead and improve GPU utilization
+    # torch.compile with max-autotune: enables Triton-based kernel selection,
+    # automatic CUDA graphs, and aggressive operator fusion for Tensor Cores.
     if getattr(args, "compile", False):
         logger.info(
-            "Compiling models with torch.compile "
-            "(first iteration will be slow due to compilation)..."
+            "Compiling models with torch.compile (mode=max-autotune). "
+            "First iteration will be slow due to compilation..."
         )
-        net_g = torch.compile(net_g)
-        net_d = torch.compile(net_d)
+        net_g = torch.compile(net_g, mode="max-autotune")
+        net_d = torch.compile(net_d, mode="max-autotune")
         if net_dur_disc is not None:
-            net_dur_disc = torch.compile(net_dur_disc)
+            net_dur_disc = torch.compile(net_dur_disc, mode="max-autotune")
         if net_wd is not None:
-            net_wd = torch.compile(net_wd)
+            net_wd = torch.compile(net_wd, mode="max-autotune")
 
     net_g = DDP(
         net_g,
@@ -680,7 +691,11 @@ def run():
     else:
         scheduler_wd = None
         wl = None
-    scaler = GradScaler(enabled=hps.train.bf16_run)
+    # Only allocate GradScaler when actually using mixed precision.
+    # For FP32 training, GradScaler methods are no-ops but still incur
+    # Python call overhead every step.
+    use_scaler = hps.train.bf16_run
+    scaler = GradScaler(enabled=True) if use_scaler else None
 
     # Move pre-collated batches to VRAM (Strategy A) or set up VRAM prefetch
     # (Strategy B) after model/optimizer/DDP are on GPU so VRAM measurement
@@ -891,7 +906,9 @@ def train_and_evaluate(
         bert = bert.cuda(local_rank, non_blocking=True)
         style_vec = style_vec.cuda(local_rank, non_blocking=True)
 
-        with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
+        # --- Use autocast only when bf16 is enabled; skip the wrapper for FP32 ---
+        _use_bf16 = hps.train.bf16_run
+        with autocast(enabled=_use_bf16, dtype=torch.bfloat16):
             (
                 y_hat,
                 l_length,
@@ -941,11 +958,10 @@ def train_and_evaluate(
 
             # Discriminator
             y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
-            with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
-                loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
-                    y_d_hat_r, y_d_hat_g
-                )
-                loss_disc_all = loss_disc
+            loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
+                y_d_hat_r, y_d_hat_g
+            )
+            loss_disc_all = loss_disc
             if net_dur_disc is not None:
                 y_dur_hat_r, y_dur_hat_g = net_dur_disc(
                     hidden_x.detach(),
@@ -954,48 +970,59 @@ def train_and_evaluate(
                     logw.detach(),
                     g.detach(),
                 )
-                with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
-                    # TODO: I think need to mean using the mask, but for now, just mean all
-                    (
-                        loss_dur_disc,
-                        losses_dur_disc_r,
-                        losses_dur_disc_g,
-                    ) = discriminator_loss(y_dur_hat_r, y_dur_hat_g)
-                    loss_dur_disc_all = loss_dur_disc
+                # TODO: I think need to mean using the mask, but for now, just mean all
+                (
+                    loss_dur_disc,
+                    losses_dur_disc_r,
+                    losses_dur_disc_g,
+                ) = discriminator_loss(y_dur_hat_r, y_dur_hat_g)
+                loss_dur_disc_all = loss_dur_disc
                 optim_dur_disc.zero_grad(set_to_none=True)
-                scaler.scale(loss_dur_disc_all).backward()
-                scaler.unscale_(optim_dur_disc)
-                # torch.nn.utils.clip_grad_norm_(
-                # parameters=net_dur_disc.parameters(), max_norm=5
-                # )
+                if scaler is not None:
+                    scaler.scale(loss_dur_disc_all).backward()
+                    scaler.unscale_(optim_dur_disc)
+                else:
+                    loss_dur_disc_all.backward()
                 grad_norm_dur = commons.clip_grad_value_(
                     net_dur_disc.parameters(), None
                 )
-                scaler.step(optim_dur_disc)
+                if scaler is not None:
+                    scaler.step(optim_dur_disc)
+                else:
+                    optim_dur_disc.step()
             if net_wd is not None:
-                # logger.debug(f"y.shape: {y.shape}, y_hat.shape: {y_hat.shape}")
                 # shape: (batch, 1, time)
-                with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
-                    loss_slm = wl.discriminator(
-                        y.detach().squeeze(1), y_hat.detach().squeeze(1)
-                    ).mean()
+                loss_slm = wl.discriminator(
+                    y.detach().squeeze(1), y_hat.detach().squeeze(1)
+                ).mean()
 
                 optim_wd.zero_grad(set_to_none=True)
-                scaler.scale(loss_slm).backward()
-                scaler.unscale_(optim_wd)
-                # torch.nn.utils.clip_grad_norm_(parameters=net_wd.parameters(), max_norm=200)
+                if scaler is not None:
+                    scaler.scale(loss_slm).backward()
+                    scaler.unscale_(optim_wd)
+                else:
+                    loss_slm.backward()
                 grad_norm_wd = commons.clip_grad_value_(net_wd.parameters(), None)
-                scaler.step(optim_wd)
+                if scaler is not None:
+                    scaler.step(optim_wd)
+                else:
+                    optim_wd.step()
 
         optim_d.zero_grad(set_to_none=True)
-        scaler.scale(loss_disc_all).backward()
-        scaler.unscale_(optim_d)
-        if getattr(hps.train, "bf16_run", False):
+        if scaler is not None:
+            scaler.scale(loss_disc_all).backward()
+            scaler.unscale_(optim_d)
+        else:
+            loss_disc_all.backward()
+        if _use_bf16:
             torch.nn.utils.clip_grad_norm_(parameters=net_d.parameters(), max_norm=200)
         grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
-        scaler.step(optim_d)
+        if scaler is not None:
+            scaler.step(optim_d)
+        else:
+            optim_d.step()
 
-        with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
+        with autocast(enabled=_use_bf16, dtype=torch.bfloat16):
             # Generator
             y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
             if net_dur_disc is not None:
@@ -1003,30 +1030,33 @@ def train_and_evaluate(
             if net_wd is not None:
                 loss_lm = wl(y.detach().squeeze(1), y_hat.squeeze(1)).mean()
                 loss_lm_gen = wl.generator(y_hat.squeeze(1))
-            with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
-                loss_dur = torch.sum(l_length.float())
-                loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
-                loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
+            loss_dur = torch.sum(l_length.float())
+            loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
+            loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
 
-                loss_fm = feature_loss(fmap_r, fmap_g)
-                loss_gen, losses_gen = generator_loss(y_d_hat_g)
-                # loss_commit = loss_commit * hps.train.c_commit
+            loss_fm = feature_loss(fmap_r, fmap_g)
+            loss_gen, losses_gen = generator_loss(y_d_hat_g)
 
-                loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
-                if net_dur_disc is not None:
-                    loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
-                    if net_wd is not None:
-                        loss_gen_all += loss_dur_gen + loss_lm + loss_lm_gen
-                    else:
-                        loss_gen_all += loss_dur_gen
+            loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
+            if net_dur_disc is not None:
+                loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
+                if net_wd is not None:
+                    loss_gen_all += loss_dur_gen + loss_lm + loss_lm_gen
+                else:
+                    loss_gen_all += loss_dur_gen
         optim_g.zero_grad(set_to_none=True)
-        scaler.scale(loss_gen_all).backward()
-        scaler.unscale_(optim_g)
-        # if getattr(hps.train, "bf16_run", False):
+        if scaler is not None:
+            scaler.scale(loss_gen_all).backward()
+            scaler.unscale_(optim_g)
+        else:
+            loss_gen_all.backward()
         torch.nn.utils.clip_grad_norm_(parameters=net_g.parameters(), max_norm=500)
         grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
-        scaler.step(optim_g)
-        scaler.update()
+        if scaler is not None:
+            scaler.step(optim_g)
+            scaler.update()
+        else:
+            optim_g.step()
 
         if rank == 0:
             if global_step % hps.train.log_interval == 0 and not hps.speedup:
